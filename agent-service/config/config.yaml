@@ -1,0 +1,67 @@
+# Agent Service Configuration
+
+llm:
+  default_provider: "claude"
+  providers:
+    claude:
+      api_key: "${CLAUDE_API_KEY}"
+      api_url: "https://api.anthropic.com"
+      model: "claude-sonnet-4-6"
+      parameters:
+        temperature: 0.7
+        max_tokens: 4096
+    openai:
+      api_key: "${OPENAI_API_KEY}"
+      api_url: "https://api.openai.com/v1"
+      model: "gpt-4"
+      parameters:
+        temperature: 0.7
+        max_tokens: 4096
+    local:
+      api_url: "http://localhost:8000/v1"
+      model: "local-model"
+      parameters:
+        temperature: 0.7
+        max_tokens: 4096
+
+# MCP服务配置 - 支持多种传输方式
+mcp:
+  # 传输类型: http, stdio, sse, websocket
+  transport: "http"
+
+  # HTTP传输配置
+  server_url: "http://localhost:5000"
+
+  # Stdio传输配置 (当 transport: "stdio" 时使用)
+  # command: "python"
+  # args: ["-m", "my_mcp_server"]
+  # env: {}
+  # cwd: null
+
+  # SSE/WebSocket传输配置
+  # api_key: null
+
+  # 通用配置
+  timeout: 30
+  reconnect: true
+  reconnect_interval: 5
+
+knowledge:
+  documents_path: "./knowledge/docs"
+  vector_store_path: "./knowledge/vectors"
+  retrieval:
+    keyword_weight: 0.4
+    vector_weight: 0.6
+    top_k: 3
+
+case_lib:
+  storage_path: "./cases"
+
+session:
+  storage_path: "./sessions"
+  max_history: 100
+
+analysis:
+  default_flow: "full_analysis"
+  retry_count: 1
+  timeout: 30

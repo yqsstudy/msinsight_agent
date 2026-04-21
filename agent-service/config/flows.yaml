@@ -1,0 +1,199 @@
+# 分析流程配置
+
+# 流程定义
+flows:
+  full_analysis:
+    description: "全量性能分析"
+    entry_point: parse_data
+    steps:
+      parse_data:
+        type: mcp_tool
+        description: "解析profiling数据"
+        params:
+          data_path: "${input.data_path}"
+        outputs:
+          data_id: "$.data_id"
+          data_type: "$.data_type"
+        next: get_overview
+
+      get_overview:
+        type: mcp_tool
+        description: "获取数据概览"
+        params:
+          data_id: "${state.data_id}"
+        outputs:
+          problem_types: "$.problem_types"
+          metrics: "$.metrics"
+        next: detect_problems
+
+      detect_problems:
+        type: internal
+        description: "检测问题类型"
+        handler: detect_problem_type
+        outputs:
+          detected_problems: "$.problems"
+        next: select_tools
+
+      select_tools:
+        type: decision
+        description: "选择分析工具"
+        decision_by: llm
+        prompt_template: |
+          基于以下分析结果，选择需要执行的分析工具：
+
+          问题类型: ${state.problem_types}
+          数据概览: ${state.metrics}
+
+          可用工具:
+          - analyze_communication: 通信问题分析（快慢卡、带宽等）
+          - analyze_memory: 内存问题分析（OOM、内存泄漏等）
+
+          请返回JSON格式:
+          {
+            "tools": ["工具名称列表"],
+            "reason": "选择理由"
+          }
+        outputs:
+          selected_tools: "$.tools"
+        next: execute_analysis
+
+      execute_analysis:
+        type: parallel
+        description: "并行执行分析"
+        branches: "${state.selected_tools}"
+        wait_all: true
+        next: generate_report
+
+      generate_report:
+        type: report
+        description: "生成诊断报告"
+        enhance_by: llm
+        outputs:
+          report: "$"
+        next: END
+
+  memory_analysis:
+    description: "内存问题专项分析"
+    entry_point: parse_data
+    steps:
+      parse_data:
+        type: mcp_tool
+        params:
+          data_path: "${input.data_path}"
+        outputs:
+          data_id: "$.data_id"
+        next: analyze_memory
+
+      analyze_memory:
+        type: mcp_tool
+        description: "内存问题分析"
+        params:
+          data_id: "${state.data_id}"
+        outputs:
+          issues: "$.issues"
+          metrics: "$.metrics"
+        next: generate_report
+
+      generate_report:
+        type: report
+        enhance_by: llm
+        next: END
+
+  communication_analysis:
+    description: "通信问题专项分析"
+    entry_point: parse_data
+    steps:
+      parse_data:
+        type: mcp_tool
+        params:
+          data_path: "${input.data_path}"
+        outputs:
+          data_id: "$.data_id"
+        next: get_comm_domains
+
+      get_comm_domains:
+        type: mcp_tool
+        description: "获取通信域列表"
+        params:
+          data_id: "${state.data_id}"
+        outputs:
+          domains: "$.domains"
+        next: check_domains
+
+      check_domains:
+        type: condition
+        description: "检查是否需要用户选择"
+        rules:
+          - condition: "len(${state.domains}) > 1"
+            then: ask_domain
+          - condition: "len(${state.domains}) == 1"
+            then: analyze_comm
+          - condition: "len(${state.domains}) == 0"
+            then: no_domain_error
+        next:
+          ask_domain: ask_domain
+          analyze_comm: analyze_slow_cards
+          no_domain_error: error
+
+      ask_domain:
+        type: user_input
+        description: "请求用户选择通信域"
+        question: "检测到多个通信域，请选择要分析的通信域："
+        options: "${state.domains}"
+        reason: "不同通信域的通信模式不同，建议先分析world_group获取全局视图"
+        outputs:
+          selected_domain: "$.choice"
+        next: analyze_slow_cards
+
+      analyze_slow_cards:
+        type: mcp_tool
+        description: "快慢卡分析"
+        params:
+          data_id: "${state.data_id}"
+          domain: "${state.selected_domain}"
+        outputs:
+          slow_cards: "$.slow_cards"
+          analysis: "$.analysis"
+        next: generate_report
+
+      generate_report:
+        type: report
+        enhance_by: llm
+        next: END
+
+      error:
+        type: terminal
+        status: error
+        message: "未找到通信域"
+
+# 内部处理器定义
+handlers:
+  detect_problem_type:
+    description: "检测问题类型"
+    input:
+      problem_types: list
+      metrics: dict
+    output:
+      problems: list
+
+# 规则定义
+rules:
+  need_user_input:
+    - id: multiple_domains
+      condition: "len(${state.domains}) > 1"
+      action: ask_user
+      message: "检测到多个通信域，请选择"
+
+    - id: multiple_clusters
+      condition: "len(${state.clusters}) > 1"
+      action: ask_user
+      message: "检测到多个集群，请选择"
+
+  skip_step:
+    - id: no_memory_issue
+      condition: "'memory' not in ${state.problem_types}"
+      skip: analyze_memory
+
+    - id: no_comm_issue
+      condition: "'communication' not in ${state.problem_types}"
+      skip: analyze_communication
