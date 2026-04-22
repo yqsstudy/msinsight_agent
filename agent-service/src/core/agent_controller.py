@@ -151,7 +151,8 @@ class AgentController:
             return result
 
         except Exception as e:
-            error_result = self.error_handler.handle(e, self.current_session)
+            error_type = self.error_handler.classify_error(e)
+            error_result = self.error_handler.handle(error_type, {"error": str(e)}, e)
             return error_result
 
     async def _handle_full_analysis(

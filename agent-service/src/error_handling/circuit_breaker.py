@@ -104,10 +104,7 @@ class CircuitBreaker:
             self._half_open_calls = 0
 
             logger.warning(
-                f"Circuit breaker opened",
-                circuit=self.name,
-                consecutive_failures=self.stats.consecutive_failures,
-                error=str(error) if error else None
+                f"Circuit breaker opened: circuit={self.name}, consecutive_failures={self.stats.consecutive_failures}, error={str(error) if error else None}"
             )
 
             if self._on_open:
@@ -122,10 +119,7 @@ class CircuitBreaker:
             self.state = CircuitState.HALF_OPEN
             self._half_open_calls = 0
 
-            logger.info(
-                f"Circuit breaker entering half-open state",
-                circuit=self.name
-            )
+            logger.info(f"Circuit breaker entering half-open state: circuit={self.name}")
 
     def _transition_to_closed(self):
         """转换到关闭状态"""
@@ -139,10 +133,7 @@ class CircuitBreaker:
             self._opened_at = None
             self._half_open_calls = 0
 
-            logger.info(
-                f"Circuit breaker closed",
-                circuit=self.name
-            )
+            logger.info(f"Circuit breaker closed: circuit={self.name}")
 
             if self._on_close:
                 try:

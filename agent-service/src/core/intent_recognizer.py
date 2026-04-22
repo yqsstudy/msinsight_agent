@@ -155,7 +155,7 @@ class IntentRecognizer:
         """检测问题类型"""
         message_lower = message.lower()
         for problem_type, keywords in self.PROBLEM_KEYWORDS.items():
-            if any(kw in message_lower for kw in keywords):
+            if any(kw.lower() in message_lower for kw in keywords):
                 return problem_type
         return None
 

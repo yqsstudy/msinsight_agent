@@ -58,22 +58,22 @@ class FallbackStrategy:
 
     def _default_value_fallback(self) -> Any:
         """默认值降级"""
-        logger.info(f"Using default value fallback: strategy=self.name")
+        logger.info(f"Using default value fallback: {self.name}")
         return self.config.default_value
 
     def _cached_value_fallback(self) -> Any:
         """缓存值降级"""
         cache_key = self.config.cache_key or self.name
         if cache_key in self._cache:
-            logger.info(f"Using cached value fallback: strategy=self.name")
+            logger.info(f"Using cached value fallback: {self.name}")
             return self._cache[cache_key]
-        logger.warning(f"No cached value available: strategy=self.name")
+        logger.warning(f"No cached value available: {self.name}")
         return self.config.default_value
 
     async def _alternative_fallback(self, *args, **kwargs) -> Any:
         """替代方法降级"""
         if self.config.alternative_func:
-            logger.info(f"Using alternative method fallback: strategy=self.name")
+            logger.info(f"Using alternative method fallback: {self.name}")
             if asyncio.iscoroutinefunction(self.config.alternative_func):
                 return await self.config.alternative_func(*args, **kwargs)
             return self.config.alternative_func(*args, **kwargs)
@@ -81,13 +81,13 @@ class FallbackStrategy:
 
     async def _simplified_fallback(self, *args, **kwargs) -> Any:
         """简化方法降级"""
-        logger.info(f"Using simplified method fallback: strategy=self.name")
+        logger.info(f"Using simplified method fallback: {self.name}")
         # 子类实现
         return self.config.default_value
 
     def _graceful_fallback(self) -> Any:
         """优雅降级"""
-        logger.info(f"Graceful degradation: strategy=self.name")
+        logger.info(f"Graceful degradation: {self.name}")
         return {
             "degraded": True,
             "message": self.config.message,
@@ -168,7 +168,7 @@ class FallbackManager:
     def register(self, name: str, strategy: FallbackStrategy):
         """注册降级策略"""
         self._strategies[name] = strategy
-        logger.info(f"Registered fallback strategy: name=name")
+        logger.info(f"Registered fallback strategy: {name}")
 
     def get(self, name: str) -> Optional[FallbackStrategy]:
         """获取降级策略"""
@@ -184,16 +184,13 @@ class FallbackManager:
         """执行降级"""
         strategy = self._strategies.get(name)
         if not strategy:
-            logger.warning(f"No fallback strategy found: name=name")
+            logger.warning(f"No fallback strategy found: {name}")
             return None
 
         self._fallback_counts[name] = self._fallback_counts.get(name, 0) + 1
 
-        logger.warning(
-            f"Executing fallback strategy",
-            strategy=name,
-            error=str(error) if error else None
-        )
+        error_str = str(error) if error else "None"
+        logger.warning(f"Executing fallback strategy: {name}, error: {error_str}")
 
         return await strategy.execute(*args, **kwargs)
 

@@ -188,14 +188,14 @@ class SSEConnectionManager:
         """建立连接"""
         queue = asyncio.Queue()
         self._active_connections[session_id] = queue
-        logger.info(f"SSE connection established: session_id=session_id")
+        logger.info(f"SSE connection established: {session_id}")
         return queue
 
     async def disconnect(self, session_id: str):
         """断开连接"""
         if session_id in self._active_connections:
             del self._active_connections[session_id]
-            logger.info(f"SSE connection closed: session_id=session_id")
+            logger.info(f"SSE connection closed: {session_id}")
 
     async def send_event(self, session_id: str, event: SSEEvent):
         """发送事件"""

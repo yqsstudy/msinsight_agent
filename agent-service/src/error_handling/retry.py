@@ -132,11 +132,7 @@ class RetryPolicy:
                 result.result = output
 
                 if attempt > 1:
-                    logger.info(
-                        f"Operation succeeded after {attempt} attempts",
-                        operation_id=operation_id,
-                        attempts=attempt
-                    )
+                    logger.info(f"Operation succeeded after {attempt} attempts: operation_id={operation_id}")
 
                 return result
 
@@ -148,26 +144,14 @@ class RetryPolicy:
                 result.retry_reasons.append(reason)
 
                 if not should_retry:
-                    logger.error(
-                        f"Operation failed, not retryable",
-                        operation_id=operation_id,
-                        error=str(e),
-                        attempt=attempt
-                    )
+                    logger.error(f"Operation failed, not retryable: operation_id={operation_id}, error={str(e)}, attempt={attempt}")
                     return result
 
                 # 计算延迟
                 delay = self.calculate_delay(attempt)
                 result.total_delay += delay
 
-                logger.warning(
-                    f"Operation failed, retrying",
-                    operation_id=operation_id,
-                    error=str(e),
-                    attempt=attempt,
-                    delay=delay,
-                    reason=reason.value
-                )
+                logger.warning(f"Operation failed, retrying: operation_id={operation_id}, error={str(e)}, attempt={attempt}, delay={delay}, reason={reason.value}")
 
                 # 等待后重试
                 await asyncio.sleep(delay)
