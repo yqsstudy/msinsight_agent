@@ -1,14 +1,18 @@
 import axios from 'axios';
 import type {
   Session,
-  Message,
   SSEEvent,
   SSEEventType,
   CircuitBreakerStatus,
   HealthCheckResult,
+  HarnessReport,
 } from '../types';
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
+const API_BASE = import.meta.env.VITE_API_BASE;
+
+if (!API_BASE) {
+  throw new Error('VITE_API_BASE is required');
+}
 
 const api = axios.create({
   baseURL: API_BASE,
@@ -22,32 +26,37 @@ const api = axios.create({
 export const sessionApi = {
   list: async (): Promise<Session[]> => {
     const response = await api.get('/api/sessions');
-    return response.data;
+    return (response.data.sessions ?? []).map((session: any) => ({
+      ...session,
+      messages: session.messages ?? [],
+    }));
   },
 
   get: async (id: string): Promise<Session> => {
     const response = await api.get(`/api/sessions/${id}`);
-    return response.data;
+    return {
+      ...response.data.session,
+      messages: response.data.session?.messages ?? [],
+      plans: response.data.plans ?? [],
+      evidence: response.data.evidence ?? [],
+      reports: response.data.reports ?? [],
+      pending_input: response.data.pending_input ?? null,
+    };
   },
 
   create: async (): Promise<Session> => {
     const response = await api.post('/api/sessions');
-    return response.data;
+    return {
+      id: response.data.session_id,
+      created_at: response.data.created_at,
+      updated_at: response.data.created_at,
+      state: 'IDLE',
+      messages: [],
+    };
   },
 
   delete: async (id: string): Promise<void> => {
     await api.delete(`/api/sessions/${id}`);
-  },
-};
-
-// Message APIs
-
-export const messageApi = {
-  send: async (sessionId: string, message: string): Promise<Message> => {
-    const response = await api.post(`/api/sessions/${sessionId}/messages`, {
-      content: message,
-    });
-    return response.data;
   },
 };
 
@@ -88,13 +97,18 @@ export const streamApi = {
 
       buffer += decoder.decode(value, { stream: true });
 
-      // Parse SSE events
       const events = parseSSEEvents(buffer);
       buffer = events.remaining;
 
       for (const event of events.parsed) {
         yield event;
       }
+    }
+
+    buffer += decoder.decode();
+    const events = parseSSEEvents(buffer, true);
+    for (const event of events.parsed) {
+      yield event;
     }
   },
 
@@ -139,49 +153,106 @@ export const streamApi = {
         yield event;
       }
     }
+
+    buffer += decoder.decode();
+    const events = parseSSEEvents(buffer, true);
+    for (const event of events.parsed) {
+      yield event;
+    }
   },
 };
 
 /**
  * 解析SSE事件
  */
-function parseSSEEvents(buffer: string): { parsed: SSEEvent[]; remaining: string } {
+function parseSSEEvents(buffer: string, flush = false): { parsed: SSEEvent[]; remaining: string } {
   const events: SSEEvent[] = [];
-  const lines = buffer.split('\n');
-  let remaining = '';
-  let currentEvent: Partial<SSEEvent> = {};
+  const normalized = buffer.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = normalized.split('\n');
+  const completeLineCount = flush || normalized.endsWith('\n') ? lines.length : lines.length - 1;
+  let currentEvent: SSEEventType | undefined;
+  let currentId: string | undefined;
+  let dataLines: string[] = [];
 
-  for (let i = 0; i < lines.length; i++) {
+  const emit = () => {
+    if (!currentEvent || dataLines.length === 0) {
+      currentEvent = undefined;
+      currentId = undefined;
+      dataLines = [];
+      return;
+    }
+
+    const dataText = dataLines.join('\n');
+    let data: any;
+    try {
+      data = JSON.parse(dataText);
+    } catch {
+      data = { raw: dataText };
+    }
+
+    events.push({ event: currentEvent, data, id: currentId });
+    currentEvent = undefined;
+    currentId = undefined;
+    dataLines = [];
+  };
+
+  for (let i = 0; i < completeLineCount; i++) {
     const line = lines[i];
-
     if (line === '') {
-      // Empty line signals end of event
-      if (currentEvent.event && currentEvent.data) {
-        events.push({
-          event: currentEvent.event as SSEEventType,
-          data: currentEvent.data,
-          id: currentEvent.id,
-        });
-      }
-      currentEvent = {};
-    } else if (line.startsWith('event: ')) {
-      currentEvent.event = line.slice(7) as SSEEventType;
-    } else if (line.startsWith('data: ')) {
-      try {
-        currentEvent.data = JSON.parse(line.slice(6));
-      } catch {
-        currentEvent.data = { raw: line.slice(6) };
-      }
-    } else if (line.startsWith('id: ')) {
-      currentEvent.id = line.slice(4);
-    } else {
-      // Incomplete line, keep for next iteration
-      remaining = line;
+      emit();
+      continue;
+    }
+    if (line.startsWith(':')) {
+      continue;
+    }
+
+    const separator = line.indexOf(':');
+    const field = separator === -1 ? line : line.slice(0, separator);
+    const value = separator === -1 ? '' : line.slice(separator + 1).replace(/^ /, '');
+
+    if (field === 'event') {
+      currentEvent = value as SSEEventType;
+    } else if (field === 'data') {
+      dataLines.push(value);
+    } else if (field === 'id') {
+      currentId = value;
     }
   }
 
-  return { parsed: events, remaining };
+  if (flush) {
+    emit();
+    return { parsed: events, remaining: '' };
+  }
+
+  return { parsed: events, remaining: lines.slice(completeLineCount).join('\n') };
 }
+
+// Report APIs
+
+export const reportApi = {
+  listBySession: async (sessionId: string): Promise<HarnessReport[]> => {
+    const response = await api.get(`/api/reports/sessions/${sessionId}`);
+    return response.data.reports;
+  },
+
+  get: async (reportId: string): Promise<HarnessReport> => {
+    const response = await api.get(`/api/reports/${reportId}`);
+    return response.data.report;
+  },
+
+  submitFeedback: async (
+    reportId: string,
+    sessionId: string,
+    adopted: boolean | null,
+    comment?: string
+  ): Promise<void> => {
+    await api.post(`/api/reports/${reportId}/feedback`, {
+      session_id: sessionId,
+      adopted,
+      comment,
+    });
+  },
+};
 
 // System Status APIs
 
@@ -202,8 +273,12 @@ export const systemApi = {
   },
 
   circuitBreakers: async (): Promise<Record<string, CircuitBreakerStatus>> => {
-    const response = await api.get('/api/error-handling/circuit-breakers');
-    return response.data;
+    try {
+      const response = await api.get('/api/error-handling/circuit-breakers');
+      return response.data;
+    } catch {
+      return {};
+    }
   },
 
   resetCircuitBreaker: async (name: string): Promise<void> => {
@@ -211,8 +286,12 @@ export const systemApi = {
   },
 
   errorStats: async (): Promise<Record<string, any>> => {
-    const response = await api.get('/api/error-handling/errors/stats');
-    return response.data;
+    try {
+      const response = await api.get('/api/error-handling/errors/stats');
+      return response.data;
+    } catch {
+      return { counts: {} };
+    }
   },
 };
 

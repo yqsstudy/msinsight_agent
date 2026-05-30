@@ -37,6 +37,18 @@ export const SessionList: React.FC<SessionListProps> = ({ onSelectSession }) => 
     }
   };
 
+  const handleSelect = async (id: string) => {
+    setLoading(true);
+    try {
+      const session = await sessionApi.get(id);
+      onSelectSession(session);
+    } catch (err: any) {
+      setError(err.message || '加载会话详情失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleDelete = async (id: string) => {
     try {
       await sessionApi.delete(id);
@@ -76,7 +88,7 @@ export const SessionList: React.FC<SessionListProps> = ({ onSelectSession }) => 
           <Card
             size="small"
             style={{ width: '100%', cursor: 'pointer' }}
-            onClick={() => onSelectSession(session)}
+            onClick={() => handleSelect(session.id)}
             hoverable
           >
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

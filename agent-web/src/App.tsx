@@ -15,7 +15,7 @@ const { Title } = Typography;
 const App: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { loadSession, reset } = useChatStore();
+  const { loadSession } = useChatStore();
 
   const menuItems = [
     { key: '/chat', icon: <MessageOutlined />, label: '对话' },
@@ -24,9 +24,6 @@ const App: React.FC = () => {
   ];
 
   const handleMenuClick = ({ key }: { key: string }) => {
-    if (key === '/chat') {
-      reset();
-    }
     navigate(key);
   };
 

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Message, Option, AnalysisReport, Session } from '../types';
+import type { Message, Option, AnalysisReport, Session, HarnessTraceEvent, ExecutionPlan, Evidence } from '../types';
 
 interface ChatState {
   // 当前会话
@@ -18,6 +18,11 @@ interface ChatState {
 
   // 分析报告
   report: AnalysisReport | null;
+  traceEvents: HarnessTraceEvent[];
+  plans: ExecutionPlan[];
+  evidence: Evidence[];
+  reports: any[];
+  pendingInput: any | null;
 
   // 错误
   error: string | null;
@@ -33,6 +38,14 @@ interface ChatState {
   setUserInputRequired: (question: string, options: Option[], reason: string) => void;
   clearUserInputRequired: () => void;
   setReport: (report: AnalysisReport) => void;
+  setPlans: (plans: ExecutionPlan[]) => void;
+  upsertPlan: (plan: ExecutionPlan) => void;
+  updateStep: (step: any) => void;
+  setEvidence: (evidence: Evidence[]) => void;
+  setReports: (reports: any[]) => void;
+  setPendingInput: (pendingInput: any | null) => void;
+  addTraceEvent: (event: HarnessTraceEvent) => void;
+  clearTraceEvents: () => void;
   setError: (error: string | null) => void;
   reset: () => void;
   loadSession: (session: Session) => void;
@@ -49,6 +62,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   inputOptions: [],
   inputReason: '',
   report: null,
+  traceEvents: [],
+  plans: [],
+  evidence: [],
+  reports: [],
+  pendingInput: null,
   error: null,
 
   // Actions
@@ -115,6 +133,36 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setReport: (report) => set({ report }),
 
+  setPlans: (plans) => set({ plans }),
+
+  upsertPlan: (plan) => set((state) => ({
+    plans: state.plans.some((item) => item.id === plan.id)
+      ? state.plans.map((item) => (item.id === plan.id ? plan : item))
+      : [...state.plans, plan],
+  })),
+
+  updateStep: (step) => set((state) => ({
+    plans: state.plans.map((plan) => {
+      if (plan.id !== step.plan_id) return plan;
+      const steps = plan.steps.some((item) => item.id === step.id)
+        ? plan.steps.map((item) => (item.id === step.id ? { ...item, ...step } : item))
+        : [...plan.steps, step];
+      return { ...plan, steps };
+    }),
+  })),
+
+  setEvidence: (evidence) => set({ evidence }),
+
+  setReports: (reports) => set({ reports }),
+
+  setPendingInput: (pendingInput) => set({ pendingInput }),
+
+  addTraceEvent: (event) => set((state) => ({
+    traceEvents: [...state.traceEvents, event],
+  })),
+
+  clearTraceEvents: () => set({ traceEvents: [] }),
+
   setError: (error) => set({ error }),
 
   reset: () => set({
@@ -127,16 +175,43 @@ export const useChatStore = create<ChatState>((set, get) => ({
     inputOptions: [],
     inputReason: '',
     report: null,
+    traceEvents: [],
+    plans: [],
+    evidence: [],
+    reports: [],
+    pendingInput: null,
     error: null,
   }),
 
-  loadSession: (session) => set({
-    sessionId: session.id,
-    messages: session.messages,
-    report: null,
-    error: null,
-    waitingForInput: session.state === 'WAITING_INPUT',
-  }),
+  loadSession: (session) => {
+    const latestReport = session.reports?.[0];
+    set({
+      sessionId: session.id,
+      messages: session.messages ?? [],
+      isStreaming: false,
+      currentContent: '',
+      report: latestReport
+        ? {
+            id: latestReport.id,
+            report_id: latestReport.id,
+            format: latestReport.format,
+            content: latestReport.content,
+            evidence_ids: latestReport.evidence_ids ?? [],
+            summary: latestReport.content?.split('\n').find((line: string) => line.trim() && !line.startsWith('#')),
+          }
+        : null,
+      traceEvents: [],
+      plans: session.plans ?? [],
+      evidence: session.evidence ?? [],
+      reports: session.reports ?? [],
+      pendingInput: session.pending_input ?? null,
+      inputQuestion: session.pending_input?.question ?? '',
+      inputOptions: session.pending_input?.options ?? [],
+      inputReason: session.pending_input?.reason ?? '',
+      error: null,
+      waitingForInput: session.state === 'WAITING_INPUT' || Boolean(session.pending_input),
+    });
+  },
 }));
 
 // Session List Store

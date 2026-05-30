@@ -69,8 +69,9 @@ npm run build
 
 - 消息列表展示
 - 流式输出显示
-- 用户选项选择
-- 分析报告展示
+- ExecutionPlan / step 执行过程展示
+- 用户选项选择和 MCP 降级确认
+- Evidence / 分析报告展示
 
 ### 历史会话 (`/sessions`)
 
@@ -96,6 +97,12 @@ for await (const event of streamApi.sendMessage(message, sessionId)) {
   switch (event.event) {
     case 'message_delta':
       // 处理消息片段
+      break;
+    case 'execution_plan_created':
+    case 'execution_step_started':
+    case 'execution_step_completed':
+    case 'execution_step_failed':
+      // 更新执行计划和步骤状态
       break;
     case 'user_input_required':
       // 显示选项

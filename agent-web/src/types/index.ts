@@ -6,6 +6,10 @@ export interface Session {
   updated_at: string;
   state: string;
   messages: Message[];
+  plans?: ExecutionPlan[];
+  evidence?: Evidence[];
+  reports?: any[];
+  pending_input?: any | null;
 }
 
 export interface Message {
@@ -17,10 +21,35 @@ export interface Message {
 }
 
 export interface AnalysisReport {
-  problems: Problem[];
-  diagnosis: string;
-  suggestions: string[];
+  id?: string;
+  report_id?: string;
+  format?: string;
+  content?: string;
+  evidence_ids?: string[];
+  problems?: Problem[];
+  diagnosis?: string;
+  suggestions?: string[];
   summary?: string;
+}
+
+export interface HarnessReport {
+  id: string;
+  session_id: string;
+  format: string;
+  content: string;
+  evidence_ids: string[];
+  metadata: Record<string, any>;
+  created_at: string;
+}
+
+export interface HarnessTraceEvent {
+  id: string;
+  event: SSEEventType;
+  title: string;
+  detail?: string;
+  status?: string;
+  timestamp: string;
+  data: Record<string, any>;
 }
 
 export interface Problem {
@@ -42,6 +71,15 @@ export type SSEEventType =
   | 'message_start'
   | 'message_delta'
   | 'message_end'
+  | 'execution_plan_created'
+  | 'execution_step_started'
+  | 'execution_step_completed'
+  | 'execution_step_failed'
+  | 'intent_detected'
+  | 'rag_retrieval'
+  | 'mcp_tool_start'
+  | 'mcp_tool_result'
+  | 'report_ready'
   | 'analysis_start'
   | 'analysis_step'
   | 'analysis_result'
@@ -54,6 +92,52 @@ export interface SSEEvent {
   event: SSEEventType;
   data: SSEEventData;
   id?: string;
+}
+
+export interface ExecutionStep {
+  id: string;
+  plan_id: string;
+  session_id: string;
+  type: string;
+  name: string;
+  status: string;
+  input?: Record<string, any>;
+  output?: Record<string, any> | null;
+  evidence_ids?: string[];
+  error?: Record<string, any> | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  elapsed_ms?: number | null;
+  metadata?: Record<string, any>;
+}
+
+export interface ExecutionPlan {
+  id: string;
+  session_id: string;
+  user_message_id?: string | null;
+  intent: string;
+  status: string;
+  goal: string;
+  steps: ExecutionStep[];
+  current_step_id?: string | null;
+  evidence_ids?: string[];
+  metadata?: Record<string, any>;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface Evidence {
+  id: string;
+  session_id: string;
+  plan_id?: string | null;
+  step_id?: string | null;
+  type: string;
+  source: string;
+  content: string;
+  summary?: string;
+  confidence?: string;
+  metadata?: Record<string, any>;
+  created_at?: string;
 }
 
 export type SSEEventData =
@@ -73,7 +157,16 @@ export interface MessageDeltaData {
 }
 
 export interface AnalysisResultData {
-  report: AnalysisReport;
+  report?: AnalysisReport;
+  summary?: string;
+  confidence?: string;
+  session_id: string;
+}
+
+export interface ReportReadyData {
+  report_id: string;
+  format: string;
+  evidence_ids: string[];
   session_id: string;
 }
 

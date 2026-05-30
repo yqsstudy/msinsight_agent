@@ -68,6 +68,7 @@ npm run dev
 
 - [需求规格](docs/requirements.md)
 - [系统设计](docs/design.md)
+- [本地启动指南](docs/startup.md)
 - [后端服务文档](agent-service/README.md)
 - [前端应用文档](agent-web/README.md)
 

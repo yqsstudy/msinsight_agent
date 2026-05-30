@@ -34,7 +34,7 @@ class StdioTransport(BaseTransport):
         self.cwd = cwd
         self._request_id = 0
         self._stdio_cm = None
-        self._session_cm = None
+        self._session_cm = Nonekey
         self._session: Optional[Any] = None
         self._connected = False
         self.last_trace: Optional[Dict[str, Any]] = None
