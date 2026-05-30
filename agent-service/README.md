@@ -8,12 +8,10 @@ AI模型训练推理调试工具定制化Agent后端服务。
 agent-service/
 ├── src/
 │   ├── core/                    # 核心组件
-│   │   ├── dag/                 # DAG工作流引擎
-│   │   │   ├── engine.py        # 核心引擎
-│   │   │   ├── executors.py     # 步骤执行器
-│   │   │   └── dag_engine.py    # DAG引擎主类
-│   │   ├── intent_recognizer.py # 意图识别
-│   │   ├── state_machine.py     # 状态机
+│   │   ├── orchestrator.py      # 动态 MCP playbook 编排
+│   │   ├── intent_router.py     # 意图路由
+│   │   ├── interaction_policy.py # 自动执行/用户确认策略
+│   │   ├── mcp_llm_assistant.py # 受控 LLM 辅助
 │   │   └── report_generator.py  # 报告生成
 │   ├── llm/                     # LLM适配层
 │   │   ├── llm_router.py        # LLM路由器
@@ -47,14 +45,12 @@ agent-service/
 │   ├── api/                     # API路由
 │   │   ├── routes/
 │   │   │   ├── sessions.py
-│   │   │   ├── messages.py
 │   │   │   ├── streaming.py     # SSE流式API
 │   │   │   └── error_handling.py
 │   │   └── sse.py               # SSE工具
 │   └── models/                  # 数据模型
 ├── config/
-│   ├── config.yaml              # 主配置
-│   └── flows.yaml               # DAG流程定义
+│   └── config.yaml              # 主配置
 ├── knowledge/                   # 知识文档
 ├── cases/                       # 案例存储
 ├── sessions/                    # 会话存储
@@ -82,8 +78,16 @@ llm:
       model: "claude-sonnet-4-6"
 
 mcp:
-  transport: "http"
-  server_url: "http://localhost:5000"
+  transport: "stdio"
+  command: "python"
+  args: ["main.py", "--transport", "stdio"]
+  cwd: "D:/Project/新建文件夹/mcp"
+
+rag:
+  enabled: true
+  base_url: "http://127.0.0.1:8001"
+  retrieve_path: "/api/v1/retrieve"
+  qa_path: "/api/v1/qa"
 ```
 
 或使用环境变量：
@@ -107,7 +111,6 @@ uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 | `/api/sessions` | POST | 创建会话 |
 | `/api/sessions/{id}` | GET | 获取会话 |
 | `/api/sessions` | GET | 列出会话 |
-| `/api/sessions/{id}/messages` | POST | 发送消息 |
 
 ### 流式API (SSE)
 
@@ -143,7 +146,16 @@ uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 | `message_start` | 消息开始 |
 | `message_delta` | 消息片段 |
 | `message_end` | 消息结束 |
+| `execution_plan_created` | 已创建本轮执行计划 |
+| `execution_step_started` | 执行步骤开始 |
+| `execution_step_completed` | 执行步骤完成 |
+| `execution_step_failed` | 执行步骤失败 |
+| `intent_detected` | 意图识别结果 |
+| `rag_retrieval` | RAG 检索状态或结果 |
+| `mcp_tool_start` | MCP 工具开始执行 |
+| `mcp_tool_result` | MCP 工具返回结果 |
 | `analysis_result` | 分析结果 |
+| `report_ready` | 报告已生成 |
 | `user_input_required` | 需要用户输入 |
 | `error` | 错误 |
 
@@ -153,8 +165,16 @@ uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 
 ```yaml
 mcp:
-  transport: "http"
-  server_url: "http://localhost:5000"
+  transport: "stdio"
+  command: "python"
+  args: ["main.py", "--transport", "stdio"]
+  cwd: "D:/Project/新建文件夹/mcp"
+
+rag:
+  enabled: true
+  base_url: "http://127.0.0.1:8001"
+  retrieve_path: "/api/v1/retrieve"
+  qa_path: "/api/v1/qa"
   timeout: 30
 ```
 
@@ -189,24 +209,9 @@ mcp:
   reconnect_interval: 5
 ```
 
-## DAG工作流
+## 动态 MCP Playbook 编排
 
-流程定义在 `config/flows.yaml`：
-
-```yaml
-flows:
-  full_analysis:
-    entry_point: parse_data
-    steps:
-      parse_data:
-        type: mcp_tool
-        params:
-          data_path: "${input.data_path}"
-        outputs:
-          data_id: "$.data_id"
-        next: get_overview
-      # ... 更多步骤
-```
+Profiling 诊断不再由本地 YAML 静态流程定义。后端会先加载 MCP `tools/list`，再调用 `search_profiler_tools` 搜索或选择 playbook，并根据 MCP 返回的 `initial_step` / `next_step` 逐步调用 `execute_profiler_tool`。LLM 只作为受控辅助，用于搜索 query 改写、明确语境下的 playbook 选择、候选排序和 schema 参数抽取。
 
 ## 错误处理
 

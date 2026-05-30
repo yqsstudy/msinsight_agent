@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from ...storage import ConfigStore
+from ...adapters import MCPGateway
 
 router = APIRouter(prefix="/api/config", tags=["config"])
 
@@ -92,3 +93,14 @@ async def update_mcp_config(server_url: str, timeout: int = 30):
     store.set("mcp.timeout", timeout)
     store.save()
     return {"success": True}
+
+
+@router.get("/mcp/status")
+async def get_mcp_status():
+    """获取 MCP 连接、tools/list 和 required meta tools 校验状态。"""
+    store = get_config_store()
+    gateway = MCPGateway(store.get_mcp_harness_config())
+    try:
+        return await gateway.health()
+    finally:
+        await gateway.close()

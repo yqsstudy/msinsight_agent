@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from ...error_handling import circuit_registry, fallback_manager, error_handler
 
-router = APIRouter(prefix="/error-handling", tags=["Error Handling"])
+router = APIRouter(prefix="/api/error-handling", tags=["Error Handling"])
 
 
 @router.get("/circuit-breakers")

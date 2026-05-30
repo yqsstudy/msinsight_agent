@@ -3,23 +3,39 @@
 import json
 import sqlite3
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import os
+import uuid
 
 from ..models import Session, Message, AnalysisContext
+from ..models.evidence import Evidence, EvidenceType, EvidenceConfidence, CreateEvidenceRequest
+from ..models.orchestration import (
+    ExecutionPlan,
+    ExecutionPlanStatus,
+    ExecutionStep,
+    ExecutionStepStatus,
+    ExecutionStepType,
+    PendingInput,
+    PendingInputOption,
+)
 
 
 class SessionStore:
     """会话存储"""
 
     def __init__(self, storage_path: str = "./sessions"):
-        self.storage_path = storage_path
-        self.db_path = os.path.join(storage_path, "sessions.db")
+        if storage_path == ":memory:" or storage_path.endswith(".db"):
+            self.db_path = storage_path
+            self.storage_path = os.path.dirname(storage_path)
+        else:
+            self.storage_path = storage_path
+            self.db_path = os.path.join(storage_path, "sessions.db")
         self._ensure_storage()
 
     def _ensure_storage(self):
         """确保存储目录和数据库存在"""
-        os.makedirs(self.storage_path, exist_ok=True)
+        if self.storage_path:
+            os.makedirs(self.storage_path, exist_ok=True)
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
@@ -55,8 +71,127 @@ class SessionStore:
             )
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS execution_plans (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_message_id TEXT,
+                intent TEXT NOT NULL,
+                status TEXT NOT NULL,
+                goal TEXT,
+                current_step_id TEXT,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_execution_plans_session ON execution_plans(session_id)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS execution_steps (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                input_json TEXT NOT NULL DEFAULT '{}',
+                output_json TEXT,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                error_json TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                started_at TEXT,
+                completed_at TEXT,
+                elapsed_ms INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (plan_id) REFERENCES execution_plans(id),
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_execution_steps_plan ON execution_steps(plan_id)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS evidence (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                plan_id TEXT,
+                step_id TEXT,
+                type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                content TEXT NOT NULL,
+                summary TEXT,
+                confidence TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+        """)
+        self._ensure_column(cursor, "evidence", "plan_id", "TEXT")
+        self._ensure_column(cursor, "evidence", "step_id", "TEXT")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_session ON evidence(session_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_plan ON evidence(plan_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_evidence_type ON evidence(type)")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_inputs (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                plan_id TEXT,
+                step_id TEXT,
+                input_type TEXT NOT NULL,
+                question TEXT NOT NULL,
+                reason TEXT,
+                options_json TEXT NOT NULL DEFAULT '[]',
+                recommended_value TEXT,
+                status TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                resolved_at TEXT,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+        """)
+        self._ensure_column(cursor, "pending_inputs", "plan_id", "TEXT")
+        self._ensure_column(cursor, "pending_inputs", "step_id", "TEXT")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                plan_id TEXT,
+                format TEXT NOT NULL,
+                content TEXT NOT NULL,
+                evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            )
+        """)
+        self._ensure_column(cursor, "reports", "plan_id", "TEXT")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                report_id TEXT,
+                adopted INTEGER,
+                comment TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id),
+                FOREIGN KEY (report_id) REFERENCES reports(id)
+            )
+        """)
+
         conn.commit()
         conn.close()
+
+    def _ensure_column(self, cursor: sqlite3.Cursor, table: str, column: str, definition: str) -> None:
+        cursor.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in cursor.fetchall()}
+        if column not in columns:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def save(self, session: Session):
         """保存会话"""
@@ -167,6 +302,415 @@ class SessionStore:
         conn.commit()
         conn.close()
         return deleted
+
+    def create_execution_plan(self, plan: ExecutionPlan) -> ExecutionPlan:
+        """创建或更新执行计划。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO execution_plans (
+                id, session_id, user_message_id, intent, status, goal,
+                current_step_id, evidence_ids_json, metadata_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            plan.id,
+            plan.session_id,
+            plan.user_message_id,
+            plan.intent.value,
+            plan.status.value,
+            plan.goal,
+            plan.current_step_id,
+            json.dumps(plan.evidence_ids, ensure_ascii=False),
+            json.dumps(plan.metadata, ensure_ascii=False),
+            plan.created_at.isoformat(),
+            plan.updated_at.isoformat(),
+        ))
+        for step in plan.steps:
+            self._upsert_execution_step(cursor, step)
+        conn.commit()
+        conn.close()
+        return plan
+
+    def update_execution_plan(self, plan: ExecutionPlan) -> ExecutionPlan:
+        plan.updated_at = datetime.utcnow()
+        return self.create_execution_plan(plan)
+
+    def get_execution_plan(self, plan_id: str) -> Optional[ExecutionPlan]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM execution_plans WHERE id = ?", (plan_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None
+        plan = self._row_to_execution_plan(row)
+        plan.steps = self._list_execution_steps_with_cursor(cursor, plan.id)
+        conn.close()
+        return plan
+
+    def list_execution_plans(self, session_id: str) -> List[ExecutionPlan]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM execution_plans
+            WHERE session_id = ?
+            ORDER BY created_at
+        """, (session_id,))
+        plans = [self._row_to_execution_plan(row) for row in cursor.fetchall()]
+        for plan in plans:
+            plan.steps = self._list_execution_steps_with_cursor(cursor, plan.id)
+        conn.close()
+        return plans
+
+    def create_execution_step(self, step: ExecutionStep) -> ExecutionStep:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        self._upsert_execution_step(cursor, step)
+        conn.commit()
+        conn.close()
+        return step
+
+    def update_execution_step(self, step: ExecutionStep) -> ExecutionStep:
+        step.updated_at = datetime.utcnow()
+        return self.create_execution_step(step)
+
+    def list_execution_steps(self, plan_id: str) -> List[ExecutionStep]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        steps = self._list_execution_steps_with_cursor(cursor, plan_id)
+        conn.close()
+        return steps
+
+    def append_plan_evidence(self, plan_id: str, evidence_id: str) -> None:
+        plan = self.get_execution_plan(plan_id)
+        if not plan or evidence_id in plan.evidence_ids:
+            return
+        plan.evidence_ids.append(evidence_id)
+        self.update_execution_plan(plan)
+
+    def append_step_evidence(self, step_id: str, evidence_id: str) -> None:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM execution_steps WHERE id = ?", (step_id,))
+        row = cursor.fetchone()
+        if row:
+            step = self._row_to_execution_step(row)
+            if evidence_id not in step.evidence_ids:
+                step.evidence_ids.append(evidence_id)
+                self._upsert_execution_step(cursor, step)
+        conn.commit()
+        conn.close()
+
+    def create_evidence(self, request: CreateEvidenceRequest) -> Evidence:
+        """创建证据记录"""
+        evidence = Evidence(
+            id=f"ev_{uuid.uuid4().hex}",
+            session_id=request.session_id,
+            plan_id=request.plan_id,
+            step_id=request.step_id,
+            type=request.type,
+            source=request.source,
+            content=request.content,
+            summary=request.summary,
+            confidence=request.confidence,
+            metadata=request.metadata,
+        )
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO evidence (id, session_id, plan_id, step_id, type, source, content, summary, confidence, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            evidence.id,
+            evidence.session_id,
+            evidence.plan_id,
+            evidence.step_id,
+            evidence.type.value,
+            evidence.source,
+            evidence.content,
+            evidence.summary,
+            evidence.confidence.value,
+            json.dumps(evidence.metadata, ensure_ascii=False),
+            evidence.created_at.isoformat(),
+        ))
+        conn.commit()
+        conn.close()
+        return evidence
+
+    def list_evidence(self, session_id: str) -> List[Evidence]:
+        """列出会话证据"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM evidence WHERE session_id = ? ORDER BY created_at", (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._row_to_evidence(row) for row in rows]
+
+    def create_pending_input(self, pending: PendingInput) -> PendingInput:
+        """创建待用户输入记录"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO pending_inputs (
+                id, session_id, plan_id, step_id, input_type, question, reason, options_json,
+                recommended_value, status, metadata_json, created_at, resolved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            pending.id,
+            pending.session_id,
+            pending.plan_id,
+            pending.step_id,
+            pending.input_type,
+            pending.question,
+            pending.reason,
+            json.dumps([option.model_dump() for option in pending.options], ensure_ascii=False),
+            pending.recommended_value,
+            pending.status,
+            json.dumps(pending.metadata, ensure_ascii=False),
+            pending.created_at.isoformat(),
+            pending.resolved_at.isoformat() if pending.resolved_at else None,
+        ))
+        conn.commit()
+        conn.close()
+        return pending
+
+    def get_active_pending_input(self, session_id: str) -> Optional[PendingInput]:
+        """获取会话中未解决的用户输入请求"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM pending_inputs
+            WHERE session_id = ? AND status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (session_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return self._row_to_pending_input(row) if row else None
+
+    def resolve_pending_input(self, pending_input_id: str) -> None:
+        """标记待输入为已解决"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE pending_inputs
+            SET status = 'resolved', resolved_at = ?
+            WHERE id = ?
+        """, (datetime.utcnow().isoformat(), pending_input_id))
+        conn.commit()
+        conn.close()
+
+    def create_report(
+        self,
+        session_id: str,
+        content: str,
+        evidence_ids: List[str],
+        report_format: str = "markdown",
+        metadata: Optional[Dict[str, Any]] = None,
+        plan_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """创建报告记录"""
+        report = {
+            "id": f"rep_{uuid.uuid4().hex}",
+            "session_id": session_id,
+            "plan_id": plan_id,
+            "format": report_format,
+            "content": content,
+            "evidence_ids": evidence_ids,
+            "metadata": metadata or {},
+            "created_at": datetime.utcnow(),
+        }
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO reports (id, session_id, plan_id, format, content, evidence_ids_json, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            report["id"],
+            session_id,
+            plan_id,
+            report_format,
+            content,
+            json.dumps(evidence_ids, ensure_ascii=False),
+            json.dumps(report["metadata"], ensure_ascii=False),
+            report["created_at"].isoformat(),
+        ))
+        conn.commit()
+        conn.close()
+        return {**report, "created_at": report["created_at"].isoformat()}
+
+    def get_report(self, report_id: str) -> Optional[Dict[str, Any]]:
+        """获取报告"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reports WHERE id = ?", (report_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "plan_id": row["plan_id"] if "plan_id" in row.keys() else None,
+            "format": row["format"],
+            "content": row["content"],
+            "evidence_ids": json.loads(row["evidence_ids_json"] or "[]"),
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+            "created_at": row["created_at"],
+        }
+
+    def list_reports(self, session_id: str) -> List[Dict[str, Any]]:
+        """列出会话报告"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM reports WHERE session_id = ? ORDER BY created_at DESC", (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [{
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "plan_id": row["plan_id"] if "plan_id" in row.keys() else None,
+            "format": row["format"],
+            "content": row["content"],
+            "evidence_ids": json.loads(row["evidence_ids_json"] or "[]"),
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+            "created_at": row["created_at"],
+        } for row in rows]
+
+    def save_feedback(
+        self,
+        session_id: str,
+        report_id: Optional[str],
+        adopted: Optional[bool],
+        comment: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """保存用户反馈"""
+        feedback = {
+            "id": f"fb_{uuid.uuid4().hex}",
+            "session_id": session_id,
+            "report_id": report_id,
+            "adopted": adopted,
+            "comment": comment,
+            "created_at": datetime.utcnow().isoformat(),
+        }
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO feedback (id, session_id, report_id, adopted, comment, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            feedback["id"],
+            session_id,
+            report_id,
+            None if adopted is None else int(adopted),
+            comment,
+            feedback["created_at"],
+        ))
+        conn.commit()
+        conn.close()
+        return feedback
+
+    def _upsert_execution_step(self, cursor: sqlite3.Cursor, step: ExecutionStep) -> None:
+        cursor.execute("""
+            INSERT OR REPLACE INTO execution_steps (
+                id, plan_id, session_id, type, name, status, input_json, output_json,
+                evidence_ids_json, error_json, metadata_json, started_at, completed_at,
+                elapsed_ms, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            step.id,
+            step.plan_id,
+            step.session_id,
+            step.type.value,
+            step.name,
+            step.status.value,
+            json.dumps(step.input, ensure_ascii=False),
+            json.dumps(step.output, ensure_ascii=False) if step.output is not None else None,
+            json.dumps(step.evidence_ids, ensure_ascii=False),
+            json.dumps(step.error, ensure_ascii=False) if step.error is not None else None,
+            json.dumps(step.metadata, ensure_ascii=False),
+            step.started_at.isoformat() if step.started_at else None,
+            step.completed_at.isoformat() if step.completed_at else None,
+            step.elapsed_ms,
+            step.created_at.isoformat(),
+            step.updated_at.isoformat(),
+        ))
+
+    def _list_execution_steps_with_cursor(self, cursor: sqlite3.Cursor, plan_id: str) -> List[ExecutionStep]:
+        cursor.execute("""
+            SELECT * FROM execution_steps
+            WHERE plan_id = ?
+            ORDER BY created_at
+        """, (plan_id,))
+        return [self._row_to_execution_step(row) for row in cursor.fetchall()]
+
+    def _row_to_execution_plan(self, row: sqlite3.Row) -> ExecutionPlan:
+        return ExecutionPlan(
+            id=row["id"],
+            session_id=row["session_id"],
+            user_message_id=row["user_message_id"],
+            intent=row["intent"],
+            status=ExecutionPlanStatus(row["status"]),
+            goal=row["goal"] or "",
+            current_step_id=row["current_step_id"],
+            evidence_ids=json.loads(row["evidence_ids_json"] or "[]"),
+            metadata=json.loads(row["metadata_json"] or "{}"),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def _row_to_execution_step(self, row: sqlite3.Row) -> ExecutionStep:
+        return ExecutionStep(
+            id=row["id"],
+            plan_id=row["plan_id"],
+            session_id=row["session_id"],
+            type=ExecutionStepType(row["type"]),
+            name=row["name"],
+            status=ExecutionStepStatus(row["status"]),
+            input=json.loads(row["input_json"] or "{}"),
+            output=json.loads(row["output_json"]) if row["output_json"] else None,
+            evidence_ids=json.loads(row["evidence_ids_json"] or "[]"),
+            error=json.loads(row["error_json"]) if row["error_json"] else None,
+            metadata=json.loads(row["metadata_json"] or "{}"),
+            started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            elapsed_ms=row["elapsed_ms"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+        )
+
+    def _row_to_evidence(self, row: sqlite3.Row) -> Evidence:
+        return Evidence(
+            id=row["id"],
+            session_id=row["session_id"],
+            plan_id=row["plan_id"] if "plan_id" in row.keys() else None,
+            step_id=row["step_id"] if "step_id" in row.keys() else None,
+            type=EvidenceType(row["type"]),
+            source=row["source"],
+            content=row["content"],
+            summary=row["summary"],
+            confidence=EvidenceConfidence(row["confidence"] or "unknown"),
+            metadata=json.loads(row["metadata_json"] or "{}"),
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    def _row_to_pending_input(self, row: sqlite3.Row) -> PendingInput:
+        options = [PendingInputOption(**item) for item in json.loads(row["options_json"] or "[]")]
+        return PendingInput(
+            id=row["id"],
+            session_id=row["session_id"],
+            plan_id=row["plan_id"] if "plan_id" in row.keys() else None,
+            step_id=row["step_id"] if "step_id" in row.keys() else None,
+            input_type=row["input_type"],
+            question=row["question"],
+            reason=row["reason"] or "",
+            options=options,
+            recommended_value=row["recommended_value"],
+            status=row["status"],
+            metadata=json.loads(row["metadata_json"] or "{}"),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
+        )
 
     def _context_to_dict(self, context: AnalysisContext) -> dict:
         """上下文转字典"""

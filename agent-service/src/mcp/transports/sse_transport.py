@@ -64,14 +64,17 @@ class SSETransport(BaseTransport):
 
         try:
             # 发送请求
+            request = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+            }
+            if params is not None:
+                request["params"] = params
+
             response = await self._client.post(
                 f"{self.server_url}/mcp",
-                json={
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": method,
-                    "params": params or {}
-                }
+                json=request
             )
             response.raise_for_status()
 

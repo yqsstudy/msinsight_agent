@@ -130,8 +130,9 @@ class WebSocketTransport(BaseTransport):
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
-            "params": params or {}
         }
+        if params is not None:
+            request["params"] = params
 
         # 创建Future等待响应
         future = asyncio.Future()

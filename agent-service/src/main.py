@@ -9,13 +9,14 @@ from prometheus_client import make_asgi_app
 
 from .api.routes import (
     sessions_router,
-    messages_router,
     config_router,
     feedback_router,
+    reports_router,
     error_handling_router,
     streaming_router,
 )
 from .api.websocket import websocket_endpoint
+from .api.routes.streaming import close_orchestrator
 from .storage import ConfigStore
 from .observability import (
     setup_logging,
@@ -29,11 +30,26 @@ from .observability import (
 logger = get_logger(__name__)
 
 
+def validate_runtime_config(config: ConfigStore) -> None:
+    environment = os.getenv("AGENT_ENV", "development").lower()
+    if environment not in {"prod", "production"}:
+        return
+
+    forbidden_defaults = {
+        "mcp.server_url": "http://localhost:5000",
+        "rag.base_url": "http://127.0.0.1:8001",
+    }
+    for key, forbidden_value in forbidden_defaults.items():
+        if config.get(key) == forbidden_value:
+            raise RuntimeError(f"{key} must be explicitly configured in production")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     # 初始化日志
     config = ConfigStore()
+    validate_runtime_config(config)
     log_level = config.get("log.level", "INFO")
     json_format = config.get("log.json_format", False)
     log_file = config.get("log.file")
@@ -59,6 +75,8 @@ async def lifespan(app: FastAPI):
     # 关闭时清理
     set_app_status("stopping")
     logger.info("Shutting down Agent Service...")
+    await close_orchestrator()
+    logger.info("Agent Service shutdown cleanup completed")
 
 
 # 创建FastAPI应用
@@ -70,19 +88,24 @@ app = FastAPI(
 )
 
 # CORS配置
+allowed_origins = [origin.strip() for origin in os.getenv("AGENT_CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()]
+allow_credentials = os.getenv("AGENT_CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
+if allow_credentials and "*" in allowed_origins:
+    raise RuntimeError("AGENT_CORS_ORIGINS cannot include '*' when credentials are enabled")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产环境应限制来源
-    allow_credentials=True,
+    allow_origins=allowed_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # 注册路由
 app.include_router(sessions_router)
-app.include_router(messages_router)
 app.include_router(config_router)
 app.include_router(feedback_router)
+app.include_router(reports_router)
 app.include_router(error_handling_router)
 app.include_router(streaming_router)
 
@@ -97,7 +120,6 @@ async def websocket_route(websocket: WebSocket, session_id: str):
 @app.get("/health")
 async def health_check():
     """完整健康检查"""
-    from .core.agent_controller_v2 import AgentControllerV2
     controller = app.state.controller if hasattr(app.state, "controller") else None
 
     if controller:

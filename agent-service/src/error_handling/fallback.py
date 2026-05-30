@@ -102,31 +102,29 @@ class FallbackStrategy:
 class MCPToolFallback(FallbackStrategy):
     """MCP工具降级策略"""
 
-    # 工具默认返回值
-    DEFAULT_RESULTS = {
-        "parse_data": {"data_id": "fallback", "data_type": "unknown"},
-        "get_overview": {"problem_types": [], "metrics": {}},
-        "get_comm_domains": {"domains": []},
-        "analyze_slow_cards": {"slow_cards": [], "analysis": {}},
-        "analyze_memory": {"issues": [], "metrics": {}},
-    }
+    TOOL_NAMES = [
+        "parse_data",
+        "get_overview",
+        "get_comm_domains",
+        "analyze_slow_cards",
+        "analyze_memory",
+    ]
 
     def __init__(self, tool_name: str):
-        default_value = self.DEFAULT_RESULTS.get(tool_name, {})
         config = FallbackConfig(
-            fallback_type=FallbackType.DEFAULT_VALUE,
-            default_value=default_value,
-            message=f"工具 {tool_name} 降级，返回默认结果"
+            fallback_type=FallbackType.GRACEFUL_DEGRADATION,
+            default_value={"tool_name": tool_name, "result_available": False},
+            message=f"工具 {tool_name} 不可用，未返回有效分析结果"
         )
         super().__init__(f"mcp_tool_{tool_name}", config)
         self.tool_name = tool_name
 
     async def _simplified_fallback(self, *args, **kwargs) -> Any:
-        """简化分析 - 返回空结果而非错误"""
         return {
-            **self.config.default_value,
-            "fallback": True,
-            "message": f"{self.tool_name} 降级执行"
+            "degraded": True,
+            "tool_name": self.tool_name,
+            "result_available": False,
+            "message": f"{self.tool_name} 不可用，未返回有效分析结果"
         }
 
 
@@ -206,7 +204,7 @@ class FallbackManager:
 fallback_manager = FallbackManager()
 
 # 注册默认降级策略
-for tool_name in MCPToolFallback.DEFAULT_RESULTS.keys():
+for tool_name in MCPToolFallback.TOOL_NAMES:
     fallback_manager.register(f"mcp_tool_{tool_name}", MCPToolFallback(tool_name))
 
 fallback_manager.register("llm", LLMFallback())

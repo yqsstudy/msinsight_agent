@@ -1,11 +1,10 @@
 """WebSocket支持 - 用于流式响应"""
 
-from typing import Optional
-from fastapi import WebSocket, WebSocketDisconnect
-import json
+from fastapi import WebSocket, status
 
-from ..core import DialogManager
-from ..storage import SessionStore
+from ..observability import get_logger
+
+logger = get_logger(__name__)
 
 
 class ConnectionManager:
@@ -34,55 +33,9 @@ manager = ConnectionManager()
 
 
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    """WebSocket端点"""
-    await manager.connect(websocket, session_id)
-
-    dialog_manager = DialogManager(SessionStore())
-
-    try:
-        while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-
-            msg_type = message.get("type")
-
-            if msg_type == "user_message":
-                # 处理用户消息
-                content = message.get("content", "")
-
-                # 发送进度更新
-                await manager.send_message(session_id, {
-                    "type": "progress",
-                    "step": "processing",
-                    "message": "正在处理您的请求..."
-                })
-
-                # TODO: 实际处理逻辑
-                response = f"收到消息: {content}"
-
-                # 发送响应
-                await manager.send_message(session_id, {
-                    "type": "response",
-                    "content": response
-                })
-
-            elif msg_type == "user_choice":
-                # 处理用户选择
-                choice = message.get("choice")
-
-                await manager.send_message(session_id, {
-                    "type": "progress",
-                    "step": "analyzing",
-                    "message": f"已选择: {choice}，继续分析..."
-                })
-
-                # TODO: 继续分析流程
-
-    except WebSocketDisconnect:
-        manager.disconnect(session_id)
-    except Exception as e:
-        await manager.send_message(session_id, {
-            "type": "error",
-            "message": str(e)
-        })
-        manager.disconnect(session_id)
+    """WebSocket endpoint is disabled until it shares the SSE orchestrator state machine."""
+    logger.warning(f"Rejected unsupported WebSocket connection: session_id={session_id}")
+    await websocket.close(
+        code=status.WS_1003_UNSUPPORTED_DATA,
+        reason="WebSocket transport is not supported; use /api/stream/message SSE endpoints.",
+    )

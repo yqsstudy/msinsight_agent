@@ -128,13 +128,9 @@ class MCPClient:
         if self._transport is None:
             await self.connect()
 
-        try:
-            tools = await self._transport.list_tools()
-            self._tools_cache = tools
-            return tools
-        except Exception as e:
-            # 如果获取失败，返回模拟工具列表（开发模式）
-            return self._get_mock_tools()
+        tools = await self._transport.list_tools()
+        self._tools_cache = tools
+        return tools
 
     async def call_tool(
         self,
@@ -165,8 +161,7 @@ class MCPClient:
         except Exception as e:
             status = "error"
             logger.error(f"MCP tool call failed: {tool_name}, error: {e}")
-            # 开发模式：返回模拟数据
-            return self._mock_tool_call(tool_name, arguments)
+            raise
         finally:
             duration = time.time() - start_time
             MCP_TOOL_CALLS.labels(tool_name=tool_name, status=status).inc()
@@ -186,104 +181,6 @@ class MCPClient:
     def clear_cache(self):
         """清除工具缓存"""
         self._tools_cache = None
-
-    # ========== 开发模式：模拟工具 ==========
-
-    def _get_mock_tools(self) -> List[Dict]:
-        """获取模拟工具列表（开发测试用）"""
-        return [
-            {
-                "name": "parse_data",
-                "description": "解析profiling数据",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data_path": {"type": "string", "description": "数据文件路径"}
-                    },
-                    "required": ["data_path"]
-                }
-            },
-            {
-                "name": "get_overview",
-                "description": "获取数据概览",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data_id": {"type": "string", "description": "数据ID"}
-                    },
-                    "required": ["data_id"]
-                }
-            },
-            {
-                "name": "get_comm_domains",
-                "description": "获取通信域列表",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data_id": {"type": "string", "description": "数据ID"}
-                    },
-                    "required": ["data_id"]
-                }
-            },
-            {
-                "name": "analyze_slow_cards",
-                "description": "快慢卡分析",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data_id": {"type": "string"},
-                        "domain": {"type": "string"}
-                    },
-                    "required": ["data_id", "domain"]
-                }
-            },
-            {
-                "name": "analyze_memory",
-                "description": "内存问题分析",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "data_id": {"type": "string"}
-                    },
-                    "required": ["data_id"]
-                }
-            }
-        ]
-
-    def _mock_tool_call(self, tool_name: str, arguments: Dict) -> Dict:
-        """模拟工具调用（开发测试用）"""
-        mock_results = {
-            "parse_data": {
-                "data_id": "mock_data_001",
-                "data_type": "profiling",
-                "summary": {"total_ranks": 8, "iterations": 100}
-            },
-            "get_overview": {
-                "problem_types": ["communication", "memory"],
-                "metrics": {"avg_latency": 150, "peak_memory": "80%"}
-            },
-            "get_comm_domains": {
-                "domains": [
-                    {"name": "world_group", "rank_count": 8},
-                    {"name": "tp_group", "rank_count": 4},
-                    {"name": "dp_group", "rank_count": 2}
-                ]
-            },
-            "analyze_slow_cards": {
-                "slow_cards": [
-                    {"rank": 3, "latency": 250, "severity": "high"},
-                    {"rank": 7, "latency": 180, "severity": "medium"}
-                ],
-                "analysis": {"bottleneck": "inter-node communication"}
-            },
-            "analyze_memory": {
-                "issues": [
-                    {"type": "peak_memory", "severity": "high", "location": "rank_0", "description": "峰值内存过高"}
-                ],
-                "metrics": {"peak_memory": "90%", "avg_memory": "65%"}
-            }
-        }
-        return mock_results.get(tool_name, {})
 
     # ========== 工厂方法 ==========
 

@@ -4,7 +4,11 @@ import json
 import os
 from typing import Dict, Any, Optional
 
-from ..models import LLMConfig, AgentConfig
+from ..models import (
+    LLMConfig, AgentConfig, RAGConfig, MCPHarnessConfig, MCPStdioConfig,
+    MCPEndpointConfig, OrchestratorConfig, StorageConfig, ReportConfig,
+    LLMAssistanceConfig
+)
 
 
 class ConfigStore:
@@ -63,6 +67,10 @@ class ConfigStore:
     }
 
     def __init__(self, config_path: str = "./config/config.yaml"):
+        if not os.path.exists(config_path):
+            package_config = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config", "config.yaml"))
+            if os.path.exists(package_config):
+                config_path = package_config
         self.config_path = config_path
         self._config: Dict[str, Any] = {}
         self._load_config()
@@ -138,7 +146,91 @@ class ConfigStore:
             mcp_server_url=self.get("mcp.server_url", "http://localhost:5000"),
             knowledge_base_path=self.get("knowledge.documents_path", "./knowledge/docs"),
             case_lib_path=self.get("case_lib.storage_path", "./cases"),
-            session_storage_path=self.get("session.storage_path", "./sessions")
+            session_storage_path=self.get("session.storage_path", "./sessions"),
+            rag=self.get_rag_config(),
+            mcp_harness=self.get_mcp_harness_config(),
+            orchestrator=self.get_orchestrator_config(),
+            storage=self.get_storage_config(),
+            report=self.get_report_config(),
+            llm_assistance=self.get_llm_assistance_config(),
+        )
+
+    def get_rag_config(self) -> RAGConfig:
+        """获取RAG配置"""
+        return RAGConfig(
+            enabled=self.get("rag.enabled", True),
+            base_url=self.get("rag.base_url", "http://127.0.0.1:8001"),
+            retrieve_path=self.get("rag.retrieve_path", "/api/v1/retrieve"),
+            qa_path=self.get("rag.qa_path", "/api/v1/qa"),
+            timeout_seconds=self.get("rag.timeout_seconds", 30),
+            top_k=self.get("rag.top_k", 5),
+        )
+
+    def get_mcp_harness_config(self) -> MCPHarnessConfig:
+        """获取MCP Harness配置"""
+        return MCPHarnessConfig(
+            enabled=self.get("mcp.enabled", True),
+            transport=self.get("mcp.transport", "stdio"),
+            timeout_seconds=self.get("mcp.timeout", self.get("mcp.timeout_seconds", 60)),
+            stdio=MCPStdioConfig(
+                command=self.get("mcp.command", "python"),
+                args=self.get("mcp.args", ["main.py", "--transport", "stdio"]),
+                cwd=self.get("mcp.cwd"),
+                env=self.get("mcp.env", {}),
+            ),
+            sse=MCPEndpointConfig(
+                url=self.get("mcp.sse_url", "http://127.0.0.1:8765/sse"),
+                api_key=self.get("mcp.api_key"),
+            ),
+            websocket=MCPEndpointConfig(
+                url=self.get("mcp.websocket_url", "ws://127.0.0.1:8765"),
+                api_key=self.get("mcp.api_key"),
+            ),
+        )
+
+    def get_orchestrator_config(self) -> OrchestratorConfig:
+        """获取Orchestrator配置"""
+        return OrchestratorConfig(
+            auto_execute=self.get("orchestrator.auto_execute", True),
+            max_auto_steps=self.get("orchestrator.max_auto_steps", 5),
+            retry_count=self.get("orchestrator.retry_count", 1),
+            require_confirmation_for_side_effects=self.get("orchestrator.require_confirmation_for_side_effects", True),
+            side_effect_tool_patterns=self.get("orchestrator.side_effect_tool_patterns", [
+                "delete_*", "write_*", "export_*", "start_*", "stop_*",
+                "restart_*", "submit_*", "rebuild_*"
+            ]),
+        )
+
+    def get_storage_config(self) -> StorageConfig:
+        """获取存储配置"""
+        sqlite_path = self.get("storage.sqlite_path", "./sessions/sessions.db")
+        if sqlite_path != ":memory:" and not os.path.isabs(sqlite_path):
+            sqlite_path = os.path.abspath(os.path.join(os.path.dirname(self.config_path), "..", sqlite_path))
+        return StorageConfig(sqlite_path=sqlite_path)
+
+    def get_report_config(self) -> ReportConfig:
+        """获取报告配置"""
+        return ReportConfig(
+            format=self.get("report.format", "markdown"),
+            save_to_session_db=self.get("report.save_to_session_db", True),
+            enable_pdf_export=self.get("report.enable_pdf_export", False),
+        )
+
+    def get_llm_router_config(self) -> Dict[str, Any]:
+        """获取 LLMRouter 需要的完整配置结构。"""
+        return self.get("llm", {})
+
+    def get_llm_assistance_config(self) -> LLMAssistanceConfig:
+        """获取受控 LLM 辅助配置。"""
+        return LLMAssistanceConfig(
+            enabled=self.get("llm_assistance.enabled", False),
+            query_rewrite_enabled=self.get("llm_assistance.query_rewrite_enabled", True),
+            candidate_recommendation_enabled=self.get("llm_assistance.candidate_recommendation_enabled", True),
+            parameter_extraction_enabled=self.get("llm_assistance.parameter_extraction_enabled", True),
+            summary_enhancement_enabled=self.get("llm_assistance.summary_enhancement_enabled", False),
+            timeout_seconds=float(self.get("llm_assistance.timeout_seconds", 3.0)),
+            max_candidates=int(self.get("llm_assistance.max_candidates", 5)),
+            max_evidence_chars=int(self.get("llm_assistance.max_evidence_chars", 6000)),
         )
 
     def get_mcp_config(self) -> Dict[str, Any]:

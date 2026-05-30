@@ -26,25 +26,62 @@ llm:
 
 # MCP服务配置 - 支持多种传输方式
 mcp:
-  # 传输类型: http, stdio, sse, websocket
-  transport: "http"
+  # 传输类型: stdio, sse, websocket, http
+  transport: "stdio"
 
   # HTTP传输配置
   server_url: "http://localhost:5000"
 
   # Stdio传输配置 (当 transport: "stdio" 时使用)
-  # command: "python"
-  # args: ["-m", "my_mcp_server"]
-  # env: {}
-  # cwd: null
+  command: "python"
+  args: ["main.py", "--transport", "stdio"]
+  env: {
+    "MSINSIGHT_MCP_TRANSPORT": "stdio",
+    "MSINSIGHT_CPP_AUTO_START_BINARY": "C:\\Program Files (x86)\\MindStudio Insight\\resources\\profiler\\server\\profiler_server.exe",
+    "MSINSIGHT_CPP_LOG_PATH": "C:\\Users\\Administrator\\.mindstudio_insight"
+  }
+  cwd: "D:/Project/新建文件夹/mcp"
 
   # SSE/WebSocket传输配置
-  # api_key: null
+  sse_url: "http://127.0.0.1:8765/sse"
+  websocket_url: "ws://127.0.0.1:8765"
+  api_key: null
 
   # 通用配置
-  timeout: 30
+  timeout: 60
   reconnect: true
   reconnect_interval: 5
+
+rag:
+  enabled: true
+  base_url: "http://127.0.0.1:8001"
+  retrieve_path: "/api/v1/retrieve"
+  qa_path: "/api/v1/qa"
+  timeout_seconds: 30
+  top_k: 5
+
+orchestrator:
+  auto_execute: true
+  max_auto_steps: 5
+  retry_count: 1
+  require_confirmation_for_side_effects: true
+  side_effect_tool_patterns:
+    - "delete_*"
+    - "write_*"
+    - "export_*"
+    - "start_*"
+    - "stop_*"
+    - "restart_*"
+    - "submit_*"
+    - "rebuild_*"
+
+storage:
+  sqlite_path: "./sessions/sessions.db"
+
+report:
+  format: "markdown"
+  save_to_session_db: true
+  enable_pdf_export: false
 
 knowledge:
   documents_path: "./knowledge/docs"

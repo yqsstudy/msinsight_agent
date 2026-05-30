@@ -45,7 +45,13 @@ async def get_session(session_id: str):
     session = store.load(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"session": session.to_dict()}
+    return {
+        "session": session.to_dict(),
+        "plans": [plan.model_dump(mode="json") for plan in store.list_execution_plans(session_id)],
+        "evidence": [item.model_dump(mode="json") for item in store.list_evidence(session_id)],
+        "reports": store.list_reports(session_id),
+        "pending_input": (store.get_active_pending_input(session_id).model_dump(mode="json") if store.get_active_pending_input(session_id) else None),
+    }
 
 
 @router.get("")

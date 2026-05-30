@@ -4,6 +4,8 @@ from typing import Dict, List, Any, Optional
 from datetime import datetime
 import uuid
 
+from ..models.evidence import Evidence, EvidenceType
+
 from ..models import (
     AnalysisReport, Problem, Diagnosis, Suggestion,
     ToolCallRecord, DataInfo, KnowledgeRef, CaseRef
@@ -83,12 +85,102 @@ class ReportGenerator:
                 CaseRef(
                     case_id=c.get("id", c.get("case_id", "")),
                     problem_description=c.get("problem_description", ""),
-                    similarity_score=c.get("similarity_score", 0.8)
+                    similarity_score=c.get("similarity_score", c.get("score", 0.0))
                 )
                 for c in similar_cases
             ]
 
         return report
+
+    def generate_markdown_from_evidence(
+        self,
+        session_id: str,
+        user_goal: str,
+        evidence: List[Evidence],
+    ) -> str:
+        """基于 Evidence 生成可审计 Markdown 报告。"""
+        rag_items = [item for item in evidence if item.type == EvidenceType.RAG_EVIDENCE]
+        mcp_items = [item for item in evidence if item.type == EvidenceType.MCP_OBSERVATION]
+        user_items = [item for item in evidence if item.type == EvidenceType.USER_INPUT]
+        conclusions = [item for item in evidence if item.type == EvidenceType.AGENT_CONCLUSION]
+        system_events = [item for item in evidence if item.type == EvidenceType.SYSTEM_EVENT]
+
+        lines = [
+            "# 性能诊断报告",
+            "",
+            "## 1. 问题摘要",
+            "",
+            user_goal or "本次会话未记录明确问题摘要。",
+            "",
+            f"- 会话 ID：`{session_id}`",
+            f"- 生成时间：{datetime.utcnow().isoformat()}",
+            "",
+            "## 2. 当前结论",
+            "",
+        ]
+
+        if conclusions:
+            lines.extend([f"- [{item.id}] {item.summary or item.content}" for item in conclusions])
+        elif mcp_items:
+            lines.append("- 已完成部分 MCP 实测分析，具体结论需结合下方证据继续判断。")
+        elif rag_items:
+            lines.append("- 当前仅包含 RAG 知识依据，尚未获得 MCP 实测 profiling 数据。")
+        else:
+            lines.append("- 当前证据不足，无法形成可靠结论。")
+
+        lines.extend(["", "## 3. 证据链", "", "### 3.1 MCP 实测证据", ""])
+        if mcp_items:
+            for item in mcp_items:
+                tool = item.metadata.get("internal_tool") or item.metadata.get("mcp_tool") or item.source
+                lines.extend([
+                    f"- **{tool}** (`{item.id}`)",
+                    f"  - 摘要：{item.summary or item.content[:300]}",
+                ])
+        else:
+            lines.append("- 暂无 MCP 实测证据。")
+
+        lines.extend(["", "### 3.2 RAG 知识依据", ""])
+        if rag_items:
+            for item in rag_items:
+                title = item.metadata.get("title") or item.metadata.get("path") or item.source
+                lines.extend([
+                    f"- **{title}** (`{item.id}`)",
+                    f"  - 摘要：{item.summary or item.content[:300]}",
+                ])
+        else:
+            lines.append("- 暂无 RAG 知识依据。")
+
+        lines.extend(["", "## 4. 可能根因排序", ""])
+        if mcp_items:
+            lines.append("1. `inference`：需要根据 MCP observation 中的异常指标进一步确认根因。")
+        else:
+            lines.append("1. `unknown`：缺少实测数据，暂不排序根因。")
+
+        lines.extend(["", "## 5. 建议下一步操作", ""])
+        if mcp_items:
+            lines.append("- 继续按照 MCP 返回的下一步 playbook 执行，直到剧本完成或出现需要人工选择的分支。")
+        else:
+            lines.append("- 提供 profiling 文件路径并启动 MCP 服务后，执行实测分析。")
+        if rag_items:
+            lines.append("- 结合 RAG 知识依据中的定位流程检查相关指标。")
+
+        lines.extend(["", "## 6. 风险与不确定性", ""])
+        if system_events:
+            for item in system_events:
+                lines.append(f"- [{item.id}] {item.summary or item.content}")
+        else:
+            lines.append("- 当前报告由已收集 evidence 自动生成，未覆盖的工具步骤可能改变最终判断。")
+
+        lines.extend(["", "## 7. 引用来源", ""])
+        for item in evidence:
+            lines.append(f"- `{item.id}`：{item.type.value} / {item.source}")
+
+        if user_items:
+            lines.extend(["", "## 附录：用户输入", ""])
+            for item in user_items:
+                lines.append(f"- `{item.id}`：{item.content}")
+
+        return "\n".join(lines)
 
     def _extract_problems(self, analysis_data: Dict[str, Any]) -> List[Problem]:
         """从分析数据中提取问题"""
@@ -240,7 +332,7 @@ class ReportGenerator:
             CaseRef(
                 case_id=c.id,
                 problem_description=c.problem_description,
-                similarity_score=0.8  # TODO: 实际相似度计算
+                similarity_score=getattr(c, "similarity_score", getattr(c, "score", 0.0))
             )
             for c in cases
         ]
