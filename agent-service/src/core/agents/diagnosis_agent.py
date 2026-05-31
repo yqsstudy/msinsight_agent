@@ -133,6 +133,10 @@ class DiagnosisAgent(BaseWorkerAgent):
         except Exception as exc:
             return AgentResult(status="failed", error_msg=str(exc))
 
+    def _is_complex_sentence(self, text: str) -> bool:
+        """Heuristic to determine if input is a conversational sentence rather than a raw value."""
+        return len(text) > 20 or any(char in text for char in ["，", "。", "！", "？", "帮我", "请", "是什么"])
+
     async def resume(self, session_id: str, plan_step_id: str, user_input: Any, suspended_metadata: dict) -> AgentResult:
         """Resume execution from a suspended state."""
         resume_action = suspended_metadata.get("resume_action")
@@ -152,35 +156,32 @@ class DiagnosisAgent(BaseWorkerAgent):
             tool_name = suspended_metadata.get("tool_name")
             resolved = suspended_metadata.get("resolved_arguments", {})
             required_missing = suspended_metadata.get("required", [])
+            tool_schema = suspended_metadata.get("tool_schema", {})
             
-            # Intelligently map simple input to missing required fields
             new_args = {}
-            if isinstance(user_input, str):
-                # If it's a full sentence, try to extract path
-                import re
-                path_match = re.search(r'([a-zA-Z]:\\[^\s"\'<>]+|/[^\s"\'<>]+)', user_input)
-                extracted_str = path_match.group(1).strip() if path_match else user_input.strip()
-
-                if len(required_missing) == 1:
-                    new_args[required_missing[0]] = extracted_str
-                elif "file_path" in required_missing:
-                    new_args["file_path"] = extracted_str
-                    if "project_name" in required_missing:
-                        import os
-                        new_args["project_name"] = os.path.basename(extracted_str)
-            else:
-                new_args = self._parse_user_arguments(user_input)
             
-            # Filter out non-tool arguments (like query, select_playbook) from resolved
-            # In a real scenario, we'd check against the tool's schema, but for now we'll just merge
-            merged = {**resolved, **new_args}
+            # --- FUNNEL 1: Fast Path (Structured Input) ---
+            if isinstance(user_input, str) and len(required_missing) == 1 and not self._is_complex_sentence(user_input):
+                 new_args[required_missing[0]] = user_input.strip()
+                 
+            # --- FUNNEL 2: Deep Path (LLM Schema Extraction) ---
+            if not new_args:
+                 new_args = await self.llm_assistant.extract_parameters_by_schema(
+                     user_input=str(user_input),
+                     tool_schema=tool_schema,
+                     existing_args=resolved
+                 )
+                 
+            # Merge and execute
+            merged_args = {**resolved, **new_args}
             
-            # Clean up arguments that don't belong to the tool if possible
-            # (e.g. metadata leaked into resolved_arguments)
-            tool_args = {k: v for k, v in merged.items() if k not in {"query", "select_playbook", "context", "agent_type", "resume_action"}}
+            # Clean arguments using schema properties
+            allowed_keys = set(tool_schema.get("properties", {}).keys())
+            allowed_keys.update({"file_path", "project_name"}) 
+            clean_args = {k: v for k, v in merged_args.items() if k in allowed_keys}
             
             auto_count = int(suspended_metadata.get("auto_step_count", 0))
-            return await self._execute_tool_and_check_next(session_id, plan_step_id, tool_name, tool_args, auto_count, context)
+            return await self._execute_tool_and_check_next(session_id, plan_step_id, tool_name, clean_args, auto_count, context)
 
         return AgentResult(status="failed", error_msg=f"Unknown resume action: {resume_action}")
 
@@ -271,7 +272,21 @@ class DiagnosisAgent(BaseWorkerAgent):
         except Exception as exc:
             return AgentResult(status="failed", error_msg=str(exc))
 
-    def _save_search_evidence(self, session_id, plan_step_id, goal, search_query, search, playbook_selection) -> str:
+    def _save_search_evidence(self, session_id: str, plan_step_id: str, goal: str, search_query: str, search: Any, playbook_selection: dict) -> str:
+        """
+        Saves the results of an MCP playbook search as evidence.
+
+        Args:
+            session_id: The ID of the current session.
+            plan_step_id: The ID of the current plan step.
+            goal: The original user goal/message.
+            search_query: The rewritten query used for searching.
+            search: The search results from the MCP gateway.
+            playbook_selection: The LLM's playbook selection metadata.
+
+        Returns:
+            The ID of the created evidence.
+        """
         evidence = self.session_store.create_evidence(CreateEvidenceRequest(
             session_id=session_id,
             step_id=plan_step_id,
@@ -296,6 +311,17 @@ class DiagnosisAgent(BaseWorkerAgent):
         return evidence.id
 
     def _resolve_step_arguments(self, step: Optional[MCPNextStep], suggested: Dict[str, Any], context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Resolves arguments for an MCP tool by merging suggested arguments with context information.
+
+        Args:
+            step: The next step definition containing the tool's schema.
+            suggested: Arguments suggested by the MCP server or LLM.
+            context: Additional context information (e.g., extracted path).
+
+        Returns:
+            A dictionary of resolved arguments.
+        """
         arguments = dict(suggested or {})
         if not step or not step.schema_:
             return arguments
@@ -314,6 +340,16 @@ class DiagnosisAgent(BaseWorkerAgent):
         return arguments
 
     def _missing_required_arguments(self, step: Optional[MCPNextStep], arguments: Dict[str, Any]) -> List[str]:
+        """
+        Identifies required arguments that are missing from the provided arguments dictionary.
+
+        Args:
+            step: The next step definition containing the tool's schema.
+            arguments: The arguments to check.
+
+        Returns:
+            A list of missing required argument names.
+        """
         if not step or not step.schema_:
             return []
         required = step.schema_.get("required", [])
@@ -327,6 +363,15 @@ class DiagnosisAgent(BaseWorkerAgent):
         return missing
 
     def _parse_user_arguments(self, user_input: Any) -> Dict[str, Any]:
+        """
+        Parses user input into a dictionary of arguments.
+
+        Args:
+            user_input: The input provided by the user (can be a string, dict, or other type).
+
+        Returns:
+            A dictionary representation of the user input.
+        """
         if isinstance(user_input, dict):
             return user_input
         if not isinstance(user_input, str):
