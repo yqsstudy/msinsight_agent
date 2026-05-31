@@ -176,3 +176,106 @@ async def test_diagnosis_agent_resume_hybrid_funnel():
     mock_llm.extract_parameters_by_schema.assert_called_once()
     called_args = agent._execute_tool_and_check_next.call_args[0][3]
     assert called_args == {"complex_param": "extracted_value"}
+
+@pytest.mark.asyncio
+async def test_diagnosis_agent_resume_structured_input(mock_dependencies):
+    agent = DiagnosisAgent(
+        mock_dependencies["mcp_gateway"],
+        mock_dependencies["session_store"],
+        mock_dependencies["policy"],
+        mock_dependencies["llm_assistant"]
+    )
+    
+    # Mock _execute_tool_and_check_next to avoid deep mocking
+    agent._execute_tool_and_check_next = AsyncMock()
+    agent._execute_tool_and_check_next.return_value = AgentResult(status="completed")
+    
+    suspended_metadata = {
+        "resume_action": "continue_mcp_with_args",
+        "tool_name": "target_tool",
+        "resolved_arguments": {"existing": "val"},
+        "required": ["param1"],
+        "tool_schema": {"properties": {"existing": {"type": "string"}, "param1": {"type": "string"}}},
+        "context": {}
+    }
+    
+    # Case 1: Input as dict
+    user_input_dict = {"param1": "value1", "extra": "ignored_if_not_in_schema"}
+    await agent.resume("s1", "step1", user_input_dict, suspended_metadata)
+    
+    # Verify cleaning logic (extra should be removed)
+    called_args = agent._execute_tool_and_check_next.call_args[0][3]
+    assert called_args == {"existing": "val", "param1": "value1"}
+    assert "extra" not in called_args
+    mock_dependencies["llm_assistant"].extract_parameters_by_schema.assert_not_called()
+
+    # Case 2: Input as JSON string
+    import json
+    agent._execute_tool_and_check_next.reset_mock()
+    user_input_json = json.dumps({"param1": "value2"})
+    await agent.resume("s1", "step1", user_input_json, suspended_metadata)
+    called_args = agent._execute_tool_and_check_next.call_args[0][3]
+    assert called_args == {"existing": "val", "param1": "value2"}
+    mock_dependencies["llm_assistant"].extract_parameters_by_schema.assert_not_called()
+
+@pytest.mark.asyncio
+async def test_diagnosis_agent_auto_continue_sanitization(mock_dependencies):
+    # Setup mocks for auto-continuation
+    mock_gateway = mock_dependencies["mcp_gateway"]
+    
+    # Step 1 result triggers auto-continue to Step 2
+    mock_next_step = MCPNextStep(
+        tool_name="next_tool", 
+        schema_={"properties": {"param2": {"type": "string"}}, "required": ["param2"]}
+    )
+    mock_result1 = MCPToolResult(
+        status="success", 
+        text="step 1 ok", 
+        next_step=mock_next_step,
+        elapsed_ms=50,
+        raw={}
+    )
+    
+    # Step 2 result (to terminate recursion)
+    mock_result2 = MCPToolResult(
+        status="success", 
+        text="step 2 ok", 
+        next_step=None,
+        elapsed_ms=50,
+        raw={}
+    )
+    
+    mock_gateway.execute_profiler_tool.side_effect = [mock_result1, mock_result2]
+    
+    mock_policy = mock_dependencies["policy"]
+    mock_policy_decision = MagicMock()
+    mock_policy_decision.action = "continue_auto"
+    mock_policy.decide_after_mcp_result.return_value = mock_policy_decision
+    
+    mock_llm = mock_dependencies["llm_assistant"]
+    # Return arguments including an "extra" one not in schema
+    mock_llm.extract_parameters.return_value = {"param2": "val2", "dirty_extra": "bad"} 
+    
+    mock_session_store = mock_dependencies["session_store"]
+    mock_evidence = MagicMock()
+    mock_evidence.id = "ev_id"
+    mock_session_store.create_evidence.return_value = mock_evidence
+    
+    agent = DiagnosisAgent(
+        mock_dependencies["mcp_gateway"],
+        mock_dependencies["session_store"],
+        mock_dependencies["policy"],
+        mock_dependencies["llm_assistant"]
+    )
+    
+    await agent._execute_tool_and_check_next("ses1", "step1", "tool1", {"arg1": "val1"}, 0, {})
+    
+    # Verify the second call (auto-continued one) was sanitized
+    # First call: tool1, {"arg1": "val1"}
+    # Second call: next_tool, {"param2": "val2"} (dirty_extra removed)
+    assert mock_gateway.execute_profiler_tool.call_count == 2
+    second_call_args = mock_gateway.execute_profiler_tool.call_args_list[1][0]
+    assert second_call_args[0] == "next_tool"
+    assert second_call_args[1] == {"param2": "val2"}
+    assert "dirty_extra" not in second_call_args[1]
+

@@ -105,6 +105,7 @@ class DiagnosisAgent(BaseWorkerAgent):
                             "tool_name": initial_step.tool_name,
                             "required": missing,
                             "resolved_arguments": resolved_args,
+                            "tool_schema": initial_step.schema_,
                             "context": {"message": goal, "path": extracted.get("path"), "selected_playbook": search.selected_playbook or search.auto_selected_playbook}
                         }
                     )
@@ -160,8 +161,13 @@ class DiagnosisAgent(BaseWorkerAgent):
             
             new_args = {}
             
-            # --- FUNNEL 1: Fast Path (Structured Input) ---
-            if isinstance(user_input, str) and len(required_missing) == 1 and not self._is_complex_sentence(user_input):
+            # --- FUNNEL 0: Structured Input (Dict or JSON) ---
+            parsed_args = self._parse_user_arguments(user_input)
+            if isinstance(user_input, dict) or (isinstance(user_input, str) and "value" not in parsed_args):
+                new_args = parsed_args
+
+            # --- FUNNEL 1: Fast Path (Single missing param, simple input) ---
+            if not new_args and isinstance(user_input, str) and len(required_missing) == 1 and not self._is_complex_sentence(user_input):
                  new_args[required_missing[0]] = user_input.strip()
                  
             # --- FUNNEL 2: Deep Path (LLM Schema Extraction) ---
@@ -244,8 +250,13 @@ class DiagnosisAgent(BaseWorkerAgent):
                         )
                     )
                 
+                # Clean arguments using schema properties
+                allowed_keys = set(next_step.schema_.get("properties", {}).keys())
+                allowed_keys.update({"file_path", "project_name"}) 
+                clean_next_args = {k: v for k, v in next_args.items() if k in allowed_keys}
+
                 # Recursive call for auto-continuation (be careful with recursion depth, though policy handles auto_count)
-                res = await self._execute_tool_and_check_next(session_id, plan_step_id, next_step.tool_name, next_args, auto_count + 1, context)
+                res = await self._execute_tool_and_check_next(session_id, plan_step_id, next_step.tool_name, clean_next_args, auto_count + 1, context)
                 res.evidence_ids.append(evidence.id)
                 return res
             
