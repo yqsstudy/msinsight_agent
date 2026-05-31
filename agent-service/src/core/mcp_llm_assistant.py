@@ -179,6 +179,58 @@ class MCPLLMOrchestrationAssistant:
         summary = result.summary.strip()
         return summary or deterministic_summary
 
+    async def extract_parameters_by_schema(self, user_input: str, tool_schema: dict, existing_args: dict) -> dict:
+        """
+        Prompts the LLM to extract parameters from user_input based strictly on the provided JSON Schema.
+        Returns a dictionary of newly extracted parameters.
+        """
+        import json
+        
+        system_prompt = f"""
+You are an expert parameter extraction assistant.
+Your task is to extract parameters from the user's input to fulfill the required tool arguments.
+
+TOOL JSON SCHEMA:
+{json.dumps(tool_schema, ensure_ascii=False, indent=2)}
+
+ALREADY PROVIDED ARGUMENTS (Do not extract these again unless the user explicitly overrides them):
+{json.dumps(existing_args, ensure_ascii=False, indent=2)}
+
+INSTRUCTIONS:
+1. Extract values from the user's input that match the properties defined in the TOOL JSON SCHEMA.
+2. Return ONLY a valid JSON object containing the extracted key-value pairs.
+3. Do not include markdown formatting like ```json or any other text.
+4. If no parameters can be extracted, return an empty JSON object: {{}}
+"""
+        messages = [
+            {"role": "system", "content": system_prompt.strip()},
+            {"role": "user", "content": user_input}
+        ]
+        
+        try:
+            response = await self.llm_router.chat(messages, temperature=0.1)
+            # handle both dictionary (if fake router returns dict) and object with .content
+            if isinstance(response, dict):
+                text = response.get("content", "").strip()
+            else:
+                text = response.content.strip() if hasattr(response, "content") else str(response).strip()
+            
+            if text.startswith("```json"):
+                text = text[7:]
+            if text.startswith("```"):
+                text = text[3:]
+            if text.endswith("```"):
+                text = text[:-3]
+            text = text.strip()
+            
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+            return {}
+        except Exception as e:
+            # Fallback to empty dict on parsing error
+            return {}
+
     async def _chat_json(self, stage: str, messages: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
         if not self.llm_router:
             return None
