@@ -207,29 +207,8 @@ INSTRUCTIONS:
             {"role": "user", "content": user_input}
         ]
         
-        try:
-            response = await self.llm_router.chat(messages, temperature=0.1)
-            # handle both dictionary (if fake router returns dict) and object with .content
-            if isinstance(response, dict):
-                text = response.get("content", "").strip()
-            else:
-                text = response.content.strip() if hasattr(response, "content") else str(response).strip()
-            
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-            
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
-            return {}
-        except Exception as e:
-            # Fallback to empty dict on parsing error
-            return {}
+        response = await self._chat_json("extract_parameters_by_schema", messages)
+        return response if response is not None else {}
 
     async def _chat_json(self, stage: str, messages: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
         if not self.llm_router:
