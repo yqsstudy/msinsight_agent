@@ -77,15 +77,20 @@ RAG 不应在分析类请求中抢先给出纯知识建议，除非：
 - 报告生成需要知识引用；
 - MCP 结果置信度不足，需要补充定位经验。
 
-### 2.3 第一阶段不做自由多 Agent
+### 2.3 分层多 Agent 协作 (Hierarchical Multi-Agent)
 
-第一阶段采用：
+项目已演进为：
 
 ```text
-Single Orchestrator Agent + RAG Expert Service + MCP Expert Service
+Orchestrator (Parent Agent) + Specialized Worker Agents (KnowledgeAgent, DiagnosisAgent)
 ```
 
-不实现多个自由对话 Agent。后续如需并行通信、算子、数据加载、系统资源等维度分析，再演进为结构化 worker 模式。
+- **Orchestrator**: 负责全局意图识别、状态机管理、信号路由 (Suspend/Resume) 和 SSE 分发。
+- **Worker Agents**: 
+  - **KnowledgeAgent**: 专门负责 RAG 检索与证据收集。
+  - **DiagnosisAgent**: 专门负责 MCP 工具链搜索、执行与参数提取。
+
+这种架构确保了职责解耦，并利用“黑板模式”有效降低了 Token 消耗。
 
 ## 3. 总体架构
 

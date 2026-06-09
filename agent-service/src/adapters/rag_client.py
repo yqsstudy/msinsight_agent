@@ -63,6 +63,8 @@ class RAGClient:
         source = item.get("source") or item.get("metadata", {}).get("source") or {}
         if isinstance(source, str):
             source = {"path": source}
+        
+        # Enhanced field mapping for MS-RAG compatibility
         source = {
             **source,
             "doc_id": source.get("doc_id") or item.get("doc_id"),
@@ -70,16 +72,23 @@ class RAGClient:
             "title": source.get("title") or item.get("doc_title") or item.get("title"),
             "section_title": source.get("section_title") or item.get("section_title"),
             "path": source.get("path") or item.get("path") or item.get("file_path") or item.get("source_url"),
-            "url": source.get("url") or item.get("source_url"),
+            "url": source.get("url") or item.get("source_url") or item.get("url"),
         }
+        
+        # Extract content from various possible fields
         content = item.get("content") or item.get("text") or item.get("document") or ""
-        score = item.get("score") or item.get("similarity") or item.get("final_score")
+        
+        # Handle scores
+        score = item.get("score") or item.get("similarity") or item.get("final_score") or item.get("relevance_score")
+        
         metadata = {
             **(item.get("metadata") or {}),
-            "vector_score": item.get("vector_score"),
+            "vector_score": item.get("vector_score") or item.get("score"),
             "keyword_score": item.get("keyword_score"),
-            "final_score": item.get("final_score"),
+            "final_score": item.get("final_score") or item.get("score"),
             "parent_topic": item.get("parent_topic"),
             "images": item.get("images", []),
+            "chunk_id": source.get("chunk_id"),
+            "doc_title": source.get("title"),
         }
         return RAGRetrieveItem(content=content, score=score, source=source, metadata=metadata, raw=item)

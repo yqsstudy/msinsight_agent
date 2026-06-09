@@ -33,14 +33,15 @@ mcp:
   server_url: "http://localhost:5000"
 
   # Stdio传输配置 (当 transport: "stdio" 时使用)
-  command: "python"
-  args: ["main.py", "--transport", "stdio"]
+  command: "python3"
+  args: ["main.py"]
   env: {
     "MSINSIGHT_MCP_TRANSPORT": "stdio",
-    "MSINSIGHT_CPP_AUTO_START_BINARY": "C:\\Program Files (x86)\\MindStudio Insight\\resources\\profiler\\server\\profiler_server.exe",
-    "MSINSIGHT_CPP_LOG_PATH": "C:\\Users\\Administrator\\.mindstudio_insight"
+    "MSINSIGHT_LOG_LEVEL": "DEBUG",
+    "MSINSIGHT_PATH_SECURITY_ENABLED": "false",
+    "MSINSIGHT_CPP_MOCK_MODE": "true"
   }
-  cwd: "D:/Project/新建文件夹/mcp"
+  cwd: "/Users/ye/yangqisheng/msinsight_agent/mcp_service_code/ms_mcp"
 
   # SSE/WebSocket传输配置
   sse_url: "http://127.0.0.1:8765/sse"
@@ -59,6 +60,16 @@ rag:
   qa_path: "/api/v1/qa"
   timeout_seconds: 30
   top_k: 5
+
+llm_assistance:
+  enabled: true
+  query_rewrite_enabled: true
+  candidate_recommendation_enabled: true
+  parameter_extraction_enabled: true
+  summary_enhancement_enabled: false
+  timeout_seconds: 30
+  max_candidates: 5
+  max_evidence_chars: 6000
 
 orchestrator:
   auto_execute: true

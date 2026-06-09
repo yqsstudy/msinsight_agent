@@ -131,15 +131,17 @@ Agent 输出结论必须尽可能基于明确证据：
 - 结论依据是什么
 - 哪些地方存在不确定性
 
-### 5.5 单 Orchestrator 优先
+### 5.5 分层多 Agent 协作
 
-第一阶段不做自由对话式多 Agent。优先实现：
+项目采用主从分层协作模式：
 
 ```text
-Single Orchestrator Agent + RAG Expert Service + MCP Expert Service
+Orchestrator (Parent Agent) + Specialized Worker Agents (Retrieval, Diagnosis)
 ```
 
-后续如需并行专家分析，再演进到结构化 worker 模式。
+- **分层控制**：Orchestrator 管理全局状态，Worker 专注领域任务。
+- **信号机制**：Worker 遇到阻塞时发出 Suspend 信号，由 Orchestrator 中转请求用户输入。
+- **黑板模式**：通过数据库共享 Evidence，避免 Agent 间直接传递长文本历史。
 
 ## 6. 功能需求
 

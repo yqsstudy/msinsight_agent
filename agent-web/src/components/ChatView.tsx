@@ -1,9 +1,9 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Input, Button, Space, Alert, Card, Typography, Tag, Timeline } from 'antd';
-import { SendOutlined, LoadingOutlined, FileTextOutlined } from '@ant-design/icons';
+import { Input, Button, Space, Alert, Card, Typography, Tag, Timeline, Select } from 'antd';
+import { SendOutlined, LoadingOutlined, FileTextOutlined, DatabaseOutlined, OrderedListOutlined } from '@ant-design/icons';
 import { useChatStore } from '../stores';
 import { reportApi, streamApi } from '../services/api';
-import type { SSEEvent, Option, UserInputRequiredData, AnalysisResultData, ReportReadyData, HarnessTraceEvent } from '../types';
+import type { SSEEvent, Option, InputField, UserInputRequiredData, AnalysisResultData, ReportReadyData, HarnessTraceEvent, DiagnosisContextSummary, CandidateSetView, DiagnosisAuditEventView, DiagnosisOperationSummary } from '../types';
 
 const { TextArea } = Input;
 const { Text, Paragraph } = Typography;
@@ -17,12 +17,27 @@ const traceTitleMap: Record<string, string> = {
   rag_retrieval: '检索知识库',
   mcp_tool_start: '开始执行 MCP 工具',
   mcp_tool_result: 'MCP 工具返回结果',
+  control_flow_waiting: '等待 MCP 事件',
+  control_flow_retrying: '重试 MCP 工具',
   analysis_result: '分析结论',
   report_ready: '报告已生成',
+  diagnosis_context_updated: '诊断上下文更新',
+  diagnosis_step_invalidated: '诊断步骤失效',
+  diagnosis_rollback_detected: '检测到回退',
+  diagnosis_auto_fill: '自动补全参数',
+  diagnosis_operation_queued: '诊断操作入队',
+  diagnosis_operation_updated: '诊断操作更新',
+  diagnosis_candidate_set_created: '候选集创建',
+  diagnosis_candidate_selected: '候选项已选择',
+  diagnosis_reconciliation: 'MCP 状态协调',
+  diagnosis_schema_drift: 'Schema 变化',
+  diagnosis_audit_event: '诊断审计事件',
+  diagnosis_pending_routed: 'Pending 输入路由',
 };
 
 export const ChatView: React.FC = () => {
   const [inputValue, setInputValue] = useState('');
+  const [fieldValues, setFieldValues] = useState<Record<string, any>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const {
@@ -36,6 +51,12 @@ export const ChatView: React.FC = () => {
     inputReason,
     report,
     traceEvents,
+    diagnosisContext,
+    diagnosisOperations,
+    activeCandidateSet,
+    pausedDiagnoses,
+    diagnosisAuditEvents,
+    pendingInput,
     error,
     setSessionId,
     addMessage,
@@ -48,6 +69,10 @@ export const ChatView: React.FC = () => {
     upsertPlan,
     updateStep,
     setPendingInput,
+    setDiagnosisContext,
+    upsertDiagnosisOperation,
+    setActiveCandidateSet,
+    addDiagnosisAuditEvent,
     addTraceEvent,
     clearTraceEvents,
     setError,
@@ -90,6 +115,36 @@ export const ChatView: React.FC = () => {
       stopStreaming();
     } catch (err: any) {
       setError(err.message || '发送失败');
+      stopStreaming();
+    }
+  };
+
+  const handleSubmitFields = async () => {
+    if (!sessionId || !pendingInput) return;
+    const fields = ((pendingInput as UserInputRequiredData).metadata?.fields || []);
+    const missingRequired = fields.some((field) => field.required !== false && (fieldValues[field.name] === undefined || fieldValues[field.name] === ''));
+    if (missingRequired) {
+      setError('请补充必填参数');
+      return;
+    }
+
+    clearUserInputRequired();
+    setFieldValues({});
+    addMessage({
+      id: `user-${Date.now()}`,
+      role: 'user',
+      content: fields.map((field) => `${field.label || field.name}: ${String(fieldValues[field.name])}`).join('，'),
+      timestamp: new Date().toISOString(),
+    });
+
+    try {
+      startStreaming();
+      for await (const event of streamApi.continueAnalysis(sessionId, fieldValues)) {
+        handleSSEEvent(event);
+      }
+      stopStreaming();
+    } catch (err: any) {
+      setError(err.message || '继续分析失败');
       stopStreaming();
     }
   };
@@ -151,20 +206,63 @@ export const ChatView: React.FC = () => {
       case 'rag_retrieval':
       case 'mcp_tool_start':
       case 'mcp_tool_result':
+      case 'control_flow_waiting':
+      case 'control_flow_retrying':
         addTraceEvent(buildTraceEvent(event));
         break;
 
       case 'user_input_required': {
         const userInputData = event.data as UserInputRequiredData;
         setPendingInput(userInputData);
+        const defaults: Record<string, any> = {};
+        (userInputData.metadata?.fields || []).forEach((field) => {
+          if (field.value !== undefined) defaults[field.name] = field.value;
+          else if (field.options?.length === 1) defaults[field.name] = field.options[0].value;
+        });
+        setFieldValues(defaults);
         setUserInputRequired(
           userInputData.question,
           userInputData.options || [],
-          userInputData.reason
+          userInputData.reason || ''
         );
         addTraceEvent(buildTraceEvent(event));
         break;
       }
+
+      case 'diagnosis_context_updated':
+        setDiagnosisContext(event.data as DiagnosisContextSummary);
+        addTraceEvent(buildTraceEvent(event));
+        break;
+
+      case 'diagnosis_operation_queued':
+      case 'diagnosis_operation_updated':
+        upsertDiagnosisOperation(event.data as DiagnosisOperationSummary);
+        addTraceEvent(buildTraceEvent(event));
+        break;
+
+      case 'diagnosis_candidate_set_created':
+        setActiveCandidateSet(event.data as CandidateSetView);
+        addTraceEvent(buildTraceEvent(event));
+        break;
+
+      case 'diagnosis_candidate_selected':
+        setActiveCandidateSet(null);
+        addTraceEvent(buildTraceEvent(event));
+        break;
+
+      case 'diagnosis_audit_event':
+        addDiagnosisAuditEvent(event.data as DiagnosisAuditEventView);
+        addTraceEvent(buildTraceEvent(event));
+        break;
+
+      case 'diagnosis_step_invalidated':
+      case 'diagnosis_rollback_detected':
+      case 'diagnosis_auto_fill':
+      case 'diagnosis_reconciliation':
+      case 'diagnosis_schema_drift':
+      case 'diagnosis_pending_routed':
+        addTraceEvent(buildTraceEvent(event));
+        break;
 
       case 'analysis_result': {
         const analysisData = event.data as AnalysisResultData;
@@ -215,7 +313,7 @@ export const ChatView: React.FC = () => {
   const buildTraceEvent = (event: SSEEvent): HarnessTraceEvent => {
     const data = event.data as Record<string, any>;
     const title = traceTitleMap[event.event] || event.event;
-    const detail = data.name || data.summary || data.reason || data.query || data.tool_name || data.report_id || data.intent || data.type;
+    const detail = data.name || data.summary || data.reason || data.control_flow?.reason || data.event_name || data.query || data.tool_name || data.report_id || data.intent || data.type;
     return {
       id: event.id || `${event.event}-${Date.now()}-${Math.random()}`,
       event: event.event,
@@ -269,6 +367,17 @@ export const ChatView: React.FC = () => {
           </div>
         )}
 
+        {/* 诊断上下文 */}
+        {(diagnosisContext || activeCandidateSet || diagnosisOperations.length > 0 || pausedDiagnoses.length > 0) && (
+          <DiagnosisContextPanel
+            context={diagnosisContext}
+            operations={diagnosisOperations}
+            candidateSet={activeCandidateSet}
+            pausedDiagnoses={pausedDiagnoses}
+            auditEvents={diagnosisAuditEvents}
+          />
+        )}
+
         {/* 执行过程 */}
         {traceEvents.length > 0 && <TraceTimeline events={traceEvents} />}
 
@@ -284,22 +393,43 @@ export const ChatView: React.FC = () => {
                 💡 {inputReason}
               </Text>
             )}
-            <Space direction="vertical" style={{ width: '100%' }}>
-              {inputOptions.map((opt, idx) => (
-                <Button
-                  key={idx}
-                  block
-                  onClick={() => handleSelectOption(opt)}
-                >
-                  {opt.label}
-                  {opt.description && (
-                    <Text type="secondary" style={{ marginLeft: 8 }}>
-                      - {opt.description}
-                    </Text>
-                  )}
-                </Button>
-              ))}
-            </Space>
+            <InvalidationImpactDialog impact={(pendingInput as UserInputRequiredData | null)?.impact} />
+            {((pendingInput as UserInputRequiredData | null)?.metadata?.param_sources) && (
+              <Space direction="vertical" style={{ width: '100%', marginBottom: 8 }}>
+                {Object.entries((pendingInput as UserInputRequiredData).metadata?.param_sources || {}).map(([key, source]) => (
+                  (source as any)?.display ? <Text key={key} type="secondary">{(source as any).display}</Text> : null
+                ))}
+              </Space>
+            )}
+            {(pendingInput as UserInputRequiredData | null)?.metadata?.llm_assistance?.status === 'timeout' && (
+              <Alert type="info" showIcon message="智能参数解析超时，已切换为规则解析。" style={{ marginBottom: 8 }} />
+            )}
+            {((pendingInput as UserInputRequiredData | null)?.metadata?.fields?.length || 0) > 0 ? (
+              <FieldInputPanel
+                fields={(pendingInput as UserInputRequiredData).metadata?.fields || []}
+                values={fieldValues}
+                onChange={(name, value) => setFieldValues((prev) => ({ ...prev, [name]: value }))}
+                onSubmit={handleSubmitFields}
+                disabled={isStreaming}
+              />
+            ) : (
+              <Space direction="vertical" style={{ width: '100%' }}>
+                {inputOptions.map((opt, idx) => (
+                  <Button
+                    key={idx}
+                    block
+                    onClick={() => handleSelectOption(opt)}
+                  >
+                    {opt.label}
+                    {opt.description && (
+                      <Text type="secondary" style={{ marginLeft: 8 }}>
+                        - {opt.description}
+                      </Text>
+                    )}
+                  </Button>
+                ))}
+              </Space>
+            )}
           </Card>
         )}
 
@@ -349,6 +479,129 @@ export const ChatView: React.FC = () => {
       </div>
     </div>
   );
+};
+
+const FieldInputPanel: React.FC<{
+  fields: InputField[];
+  values: Record<string, any>;
+  onChange: (name: string, value: any) => void;
+  onSubmit: () => void;
+  disabled?: boolean;
+}> = ({ fields, values, onChange, onSubmit, disabled }) => (
+  <Space direction="vertical" style={{ width: '100%' }}>
+    {fields.map((field) => (
+      <div key={field.name}>
+        <Text strong>{field.label || field.name}</Text>
+        {field.required !== false && <Text type="danger"> *</Text>}
+        {field.description && (
+          <Text type="secondary" style={{ display: 'block', marginBottom: 4 }}>
+            {field.description}
+          </Text>
+        )}
+        {field.type === 'select' && field.options?.length ? (
+          <Select
+            style={{ width: '100%' }}
+            value={values[field.name]}
+            placeholder={`请选择${field.label || field.name}`}
+            disabled={disabled}
+            onChange={(value) => onChange(field.name, value)}
+            options={field.options.map((option) => ({
+              label: option.description ? `${option.label} - ${option.description}` : option.label,
+              value: option.value as any,
+            }))}
+          />
+        ) : (
+          <Input
+            value={values[field.name] ?? ''}
+            placeholder={field.description || `请输入${field.label || field.name}`}
+            disabled={disabled}
+            onChange={(event) => onChange(field.name, event.target.value)}
+          />
+        )}
+      </div>
+    ))}
+    <Button type="primary" onClick={onSubmit} disabled={disabled}>
+      提交参数
+    </Button>
+  </Space>
+);
+
+const DiagnosisContextPanel: React.FC<{
+  context: DiagnosisContextSummary | null;
+  operations: DiagnosisOperationSummary[];
+  candidateSet: CandidateSetView | null;
+  pausedDiagnoses: any[];
+  auditEvents: DiagnosisAuditEventView[];
+}> = ({ context, operations, candidateSet, pausedDiagnoses, auditEvents }) => (
+  <Card title={<Space><DatabaseOutlined />诊断上下文</Space>} size="small" style={{ marginBottom: 12, maxWidth: '90%' }}>
+    {context && (
+      <Space direction="vertical" style={{ width: '100%' }}>
+        <Space wrap>
+          <Tag color="blue">{context.diagnosis_id}</Tag>
+          <Tag>{context.status}</Tag>
+          <Tag>rev {context.revision}</Tag>
+          {context.current_tool_name && <Tag color="purple">{context.current_tool_name}</Tag>}
+        </Space>
+        {context.known_params && Object.keys(context.known_params).length > 0 && (
+          <ParameterProvenancePanel params={context.known_params} sources={context.param_sources || {}} />
+        )}
+      </Space>
+    )}
+    {candidateSet && <CandidateSetPanel candidateSet={candidateSet} />}
+    {operations.length > 0 && <DiagnosisOperationQueue operations={operations} />}
+    {pausedDiagnoses.length > 0 && <PausedDiagnosisList diagnoses={pausedDiagnoses} />}
+    {auditEvents.length > 0 && <Text type="secondary">审计事件：{auditEvents.length}</Text>}
+  </Card>
+);
+
+const ParameterProvenancePanel: React.FC<{ params: Record<string, any>; sources: Record<string, any> }> = ({ params, sources }) => (
+  <div>
+    <Text strong>参数：</Text>
+    <Space size={[4, 4]} wrap style={{ marginLeft: 8 }}>
+      {Object.entries(params).map(([key, value]) => (
+        <Tag key={key}>{key}={String(value)} · {sources[key]?.source || 'unknown'}</Tag>
+      ))}
+    </Space>
+  </div>
+);
+
+const CandidateSetPanel: React.FC<{ candidateSet: CandidateSetView }> = ({ candidateSet }) => (
+  <div style={{ marginTop: 8 }}>
+    <Text strong><OrderedListOutlined /> 候选集：</Text>
+    <Space size={[4, 4]} wrap style={{ marginLeft: 8 }}>
+      {candidateSet.candidates.map((item) => (
+        <Tag key={item.global_index}>#{item.global_index} {item.label}</Tag>
+      ))}
+      {candidateSet.truncated && <Tag color="orange">仅展示前 20 / {candidateSet.candidate_count}</Tag>}
+    </Space>
+  </div>
+);
+
+const DiagnosisOperationQueue: React.FC<{ operations: DiagnosisOperationSummary[] }> = ({ operations }) => (
+  <div style={{ marginTop: 8 }}>
+    <Text strong>操作队列：</Text>
+    <Space size={[4, 4]} wrap style={{ marginLeft: 8 }}>
+      {operations.slice(-5).map((operation) => (
+        <Tag key={operation.operation_id} color={operation.status === 'failed' || operation.status === 'stale' ? 'red' : operation.status === 'completed' ? 'green' : 'blue'}>
+          {operation.type}:{operation.status}
+        </Tag>
+      ))}
+    </Space>
+  </div>
+);
+
+const PausedDiagnosisList: React.FC<{ diagnoses: any[] }> = ({ diagnoses }) => (
+  <div style={{ marginTop: 8 }}>
+    <Text strong>已暂停诊断：</Text>
+    <Space size={[4, 4]} wrap style={{ marginLeft: 8 }}>
+      {diagnoses.map((diagnosis) => <Tag key={diagnosis.diagnosis_id}>{diagnosis.diagnosis_id}</Tag>)}
+    </Space>
+  </div>
+);
+
+const InvalidationImpactDialog: React.FC<{ impact?: { invalidated_steps?: number[] } }> = ({ impact }) => {
+  if (!impact?.invalidated_steps?.length) return null;
+  return <Alert type="warning" message={`将失效步骤：${impact.invalidated_steps.join(', ')}`} />;
 };
 
 const TraceTimeline: React.FC<{ events: HarnessTraceEvent[] }> = ({ events }) => (

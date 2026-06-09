@@ -33,60 +33,89 @@ class StdioTransport(BaseTransport):
         self.env = env or {}
         self.cwd = cwd
         self._request_id = 0
-        self._stdio_cm = None
-        self._session_cm = Nonekey
         self._session: Optional[Any] = None
         self._connected = False
         self.last_trace: Optional[Dict[str, Any]] = None
+        self._bg_task: Optional[asyncio.Task] = None
+        self._stop_event: Optional[asyncio.Event] = None
+        self._init_future: Optional[asyncio.Future] = None
 
-    async def connect(self) -> bool:
-        """Start the MCP server and initialize an SDK client session."""
-        if self._connected and self._session is not None:
-            return True
-
+    async def _run_session(self):
         command_display = " ".join([str(self.command), *[str(arg) for arg in self.args]])
         try:
             ClientSession, StdioServerParameters, stdio_client = self._load_sdk()
-            logger.info(f"Starting MCP stdio SDK session: command={command_display}, cwd={self.cwd}")
             server_params = StdioServerParameters(
                 command=self.command,
                 args=self.args,
                 env=self.env or None,
                 cwd=self.cwd,
             )
-            self._stdio_cm = stdio_client(server_params)
-            read_stream, write_stream = await self._stdio_cm.__aenter__()
-            self._session_cm = ClientSession(read_stream, write_stream)
-            self._session = await self._session_cm.__aenter__()
-            await asyncio.wait_for(self._session.initialize(), timeout=self.timeout)
-            self._connected = True
+            logger.info(f"Starting MCP stdio SDK session: command={command_display}, cwd={self.cwd}")
+            async with stdio_client(server_params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    self._session = session
+                    self._connected = True
+                    self._init_future.set_result(True)
+                    
+                    # Keep session alive
+                    await self._stop_event.wait()
+                    
+        except Exception as exc:
+            logger.exception(f"MCP SDK session error: command={command_display}, cwd={self.cwd}, error={exc}")
+            if not self._init_future.done():
+                self._init_future.set_exception(exc)
+        finally:
+            self._connected = False
+            self._session = None
+
+    async def connect(self) -> bool:
+        """Start the MCP server and initialize an SDK client session."""
+        if self._connected and self._session is not None:
+            return True
+            
+        if self._bg_task is not None:
+            await asyncio.wait_for(self._init_future, timeout=self.timeout)
+            return True
+
+        self._stop_event = asyncio.Event()
+        self._init_future = asyncio.Future()
+        self._bg_task = asyncio.create_task(self._run_session())
+        
+        try:
+            await asyncio.wait_for(self._init_future, timeout=self.timeout)
             return True
         except Exception as exc:
             await self.disconnect()
-            detail = f"{type(exc).__name__}: {exc!r}"
-            logger.exception(f"Failed to start MCP stdio SDK session: command={command_display}, cwd={self.cwd}, error={detail}")
-            raise ConnectionError(f"Failed to start MCP process: command={command_display}, cwd={self.cwd}, error={detail}") from exc
+            raise ConnectionError(f"Failed to start MCP process: {exc}") from exc
 
     async def disconnect(self) -> None:
         """Close SDK session and stop the MCP server process."""
-        session_cm = self._session_cm
-        stdio_cm = self._stdio_cm
-        self._session = None
-        self._session_cm = None
-        self._stdio_cm = None
-        self._connected = False
-
-        if session_cm is not None:
-            try:
+        # Compatibility with older direct context-manager based tests/callers.
+        session_cm = getattr(self, "_session_cm", None)
+        stdio_cm = getattr(self, "_stdio_cm", None)
+        if self._bg_task is None:
+            if session_cm is not None:
                 await session_cm.__aexit__(None, None, None)
-            except Exception as exc:
-                logger.warning(f"Failed to close MCP ClientSession cleanly: {type(exc).__name__}: {exc!r}")
-
-        if stdio_cm is not None:
-            try:
+            if stdio_cm is not None:
                 await stdio_cm.__aexit__(None, None, None)
-            except Exception as exc:
-                logger.warning(f"Failed to close MCP stdio context cleanly: {type(exc).__name__}: {exc!r}")
+
+        if self._stop_event:
+            self._stop_event.set()
+
+        if self._bg_task:
+            try:
+                await asyncio.wait_for(self._bg_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._bg_task.cancel()
+            except Exception:
+                pass
+                
+        self._bg_task = None
+        self._stop_event = None
+        self._init_future = None
+        self._session = None
+        self._connected = False
 
     async def send_request(self, method: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Compatibility shim for existing callers; prefer typed SDK methods."""

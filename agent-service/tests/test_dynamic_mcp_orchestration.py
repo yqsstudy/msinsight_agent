@@ -9,7 +9,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.core.orchestrator import Orchestrator
-from src.models.orchestration import MCPNextStep, MCPSearchResult, MCPToolResult
+from src.models.orchestration import ControlFlow, MCPNextStep, MCPSearchResult, MCPToolResult
 from src.storage.session_store import SessionStore
 
 
@@ -157,3 +157,98 @@ async def test_next_step_tool_name_comes_from_mcp_result(tmp_path):
 
     assert gateway.executed == [("pt_snap_set_focus", {}), ("pt_snap_list_templates", {})]
     assert any(event.event == "analysis_result" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_structured_blocked_result_retries_then_succeeds(tmp_path, monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("src.core.agents.diagnosis_agent.asyncio.sleep", no_sleep)
+    search = MCPSearchResult(
+        status="completed",
+        text="已自动选择剧本：custom",
+        selected_playbook="custom",
+        initial_step=MCPNextStep(tool_name="wait_for_cluster", schema={"properties": {}}),
+    )
+    blocked = MCPToolResult(
+        status="completed",
+        tool_name="wait_for_cluster",
+        text="waiting",
+        control_flow=ControlFlow(
+            status="BLOCKED",
+            reason="WAITING_FOR_EVENT",
+            event_name="clusterCompleted",
+            operation_id="cluster-op-1",
+            retryable=True,
+            suggested_retry_after_ms=1,
+        ),
+    )
+    success = MCPToolResult(
+        status="completed",
+        tool_name="wait_for_cluster",
+        text="done",
+        control_flow=ControlFlow(status="SUCCESS"),
+    )
+    gateway = FakeMCPGateway(search, [blocked, success])
+    orchestrator = make_orchestrator(gateway, tmp_path)
+
+    events = [event async for event in orchestrator._handle_diagnosis("ses_6", "等待聚类", {}, None)]
+
+    assert gateway.executed == [("wait_for_cluster", {}), ("wait_for_cluster", {})]
+    assert any(event.event == "analysis_result" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_structured_needs_user_input_suspends(tmp_path):
+    search = MCPSearchResult(
+        status="completed",
+        text="已自动选择剧本：custom",
+        selected_playbook="custom",
+        initial_step=MCPNextStep(tool_name="need_profile", schema={"properties": {}}),
+    )
+    needs_input = MCPToolResult(
+        status="completed",
+        tool_name="need_profile",
+        text="need input",
+        requires_user_input=True,
+        control_flow=ControlFlow(
+            status="NEEDS_USER_INPUT",
+            reason="MISSING_REQUIRED_PARAMETER",
+            retryable=False,
+            required_inputs=[{"name": "profile_path", "type": "string", "description": "请提供 profiling 数据路径"}],
+        ),
+    )
+    gateway = FakeMCPGateway(search, [needs_input])
+    orchestrator = make_orchestrator(gateway, tmp_path)
+
+    events = [event async for event in orchestrator._handle_diagnosis("ses_7", "分析", {}, None)]
+
+    pending = next(event for event in events if event.event == "user_input_required")
+    assert pending.data["input_type"] == "params"
+    assert pending.data["metadata"]["required"] == ["profile_path"]
+
+
+@pytest.mark.asyncio
+async def test_structured_fatal_error_emits_error(tmp_path):
+    search = MCPSearchResult(
+        status="completed",
+        text="已自动选择剧本：custom",
+        selected_playbook="custom",
+        initial_step=MCPNextStep(tool_name="bad_tool", schema={"properties": {}}),
+    )
+    fatal = MCPToolResult(
+        status="failed",
+        tool_name="bad_tool",
+        text="bad",
+        error="invalid parameter",
+        control_flow=ControlFlow(status="FATAL_ERROR", reason="INVALID_PARAMETER", retryable=False),
+    )
+    gateway = FakeMCPGateway(search, [fatal])
+    orchestrator = make_orchestrator(gateway, tmp_path)
+
+    events = [event async for event in orchestrator._handle_diagnosis("ses_8", "分析", {}, None)]
+
+    error = next(event for event in events if event.event == "error")
+    assert error.data["code"] == "AGENT_ERROR"
+    assert "invalid parameter" in error.data["message"]

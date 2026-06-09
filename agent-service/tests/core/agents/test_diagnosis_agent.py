@@ -40,6 +40,9 @@ async def test_diagnosis_agent_run_suspends_on_user_choice(mock_dependencies):
     mock_evidence.id = "ev1"
     mock_session_store.create_evidence.return_value = mock_evidence
     
+    mock_context = MagicMock()
+    mock_dependencies["session_store"].get_diagnosis_context.return_value = mock_context
+
     agent = DiagnosisAgent(
         mock_dependencies["mcp_gateway"],
         mock_dependencies["session_store"],
@@ -49,7 +52,7 @@ async def test_diagnosis_agent_run_suspends_on_user_choice(mock_dependencies):
     
     result = await agent.run("session1", "step1", "goal", {"extracted": {}})
     
-    assert result.status == "suspended"
+    print(result.error_msg); assert result.status == "suspended"
     assert result.requirement.input_type == "choice"
     assert "ev1" in result.evidence_ids
 
@@ -76,13 +79,16 @@ async def test_diagnosis_agent_execute_tool_and_check_next_metadata(mock_depende
     mock_policy.decide_after_mcp_result.return_value = mock_policy_decision
     
     mock_llm = mock_dependencies["llm_assistant"]
-    mock_llm.extract_parameters.return_value = {} # simulates missing param
+    mock_llm.extract_parameters_by_schema.return_value = {} # simulates missing param
     
     mock_session_store = mock_dependencies["session_store"]
     mock_evidence = MagicMock()
     mock_evidence.id = "ev2"
     mock_session_store.create_evidence.return_value = mock_evidence
     
+    mock_context = MagicMock()
+    mock_dependencies["session_store"].get_diagnosis_context.return_value = mock_context
+
     agent = DiagnosisAgent(
         mock_dependencies["mcp_gateway"],
         mock_dependencies["session_store"],
@@ -90,8 +96,14 @@ async def test_diagnosis_agent_execute_tool_and_check_next_metadata(mock_depende
         mock_dependencies["llm_assistant"]
     )
     
+    mock_context = MagicMock()
+    mock_context.diagnosis_id = "test_id"
+    mock_context.revision = 1
+    mock_context.known_params = {}
+    mock_context.completed_steps = []
+    
     # Test tool execution and metadata population
-    result = await agent._execute_tool_and_check_next("ses1", "step1", "tool1", {"arg1": "val1"}, 0, {})
+    result = await agent._execute_tool_and_check_next("ses1", "step1", "tool1", {"arg1": "val1"}, 0, mock_context)
     
     assert result.status == "suspended"
     assert "tool_schema" in result.requirement.metadata
@@ -106,6 +118,9 @@ async def test_diagnosis_agent_execute_tool_and_check_next_metadata(mock_depende
 
 @pytest.mark.asyncio
 async def test_diagnosis_agent_resume_with_args(mock_dependencies):
+    mock_context = MagicMock()
+    mock_dependencies["session_store"].get_diagnosis_context.return_value = mock_context
+
     agent = DiagnosisAgent(
         mock_dependencies["mcp_gateway"],
         mock_dependencies["session_store"],
@@ -123,7 +138,8 @@ async def test_diagnosis_agent_resume_with_args(mock_dependencies):
         "resolved_arguments": {"existing": "val"},
         "required": ["file_path"],
         "tool_schema": {"properties": {"existing": {"type": "string"}, "file_path": {"type": "string"}}},
-        "context": {"extracted": {}}
+        "context": {"extracted": {}},
+        "diagnosis_id": "test_id"
     }
     
     result = await agent.resume("session1", "step1", "/tmp/log", suspended_metadata)
@@ -143,7 +159,10 @@ async def test_diagnosis_agent_resume_hybrid_funnel():
     mock_llm = AsyncMock()
     mock_llm.extract_parameters_by_schema.return_value = {"complex_param": "extracted_value"}
     
-    agent = DiagnosisAgent(AsyncMock(), MagicMock(), MagicMock(), mock_llm)
+    mock_session_store = MagicMock()
+    mock_context = MagicMock()
+    mock_session_store.get_diagnosis_context.return_value = mock_context
+    agent = DiagnosisAgent(AsyncMock(), mock_session_store, MagicMock(), mock_llm)
     agent._execute_tool_and_check_next = AsyncMock(return_value=MagicMock(status="completed"))
     
     # Test 1: Fast Path (single missing parameter, simple input)
@@ -153,9 +172,11 @@ async def test_diagnosis_agent_resume_hybrid_funnel():
         "required": ["simple_id"],
         "resolved_arguments": {},
         "tool_schema": {"properties": {"simple_id": {"type": "string"}}},
-        "context": {}
+        "context": {},
+        "diagnosis_id": "test_id"
     }
-    await agent.resume("s1", "step1", "123", fast_metadata)
+    result = await agent.resume("s1", "step1", "123", fast_metadata)
+    print(result.error_msg)
     # Check that LLM wasn't called and execute received the fast mapped arg
     mock_llm.extract_parameters_by_schema.assert_not_called()
     called_args = agent._execute_tool_and_check_next.call_args[0][3]
@@ -169,7 +190,8 @@ async def test_diagnosis_agent_resume_hybrid_funnel():
         "required": ["complex_param"],
         "resolved_arguments": {},
         "tool_schema": {"properties": {"complex_param": {"type": "string"}}},
-        "context": {}
+        "context": {},
+        "diagnosis_id": "test_id"
     }
     await agent.resume("s1", "step1", "帮我查一下复杂参数是提取值的那个", deep_metadata)
     # Check that LLM was called
@@ -179,6 +201,9 @@ async def test_diagnosis_agent_resume_hybrid_funnel():
 
 @pytest.mark.asyncio
 async def test_diagnosis_agent_resume_structured_input(mock_dependencies):
+    mock_context = MagicMock()
+    mock_dependencies["session_store"].get_diagnosis_context.return_value = mock_context
+
     agent = DiagnosisAgent(
         mock_dependencies["mcp_gateway"],
         mock_dependencies["session_store"],
@@ -196,7 +221,8 @@ async def test_diagnosis_agent_resume_structured_input(mock_dependencies):
         "resolved_arguments": {"existing": "val"},
         "required": ["param1"],
         "tool_schema": {"properties": {"existing": {"type": "string"}, "param1": {"type": "string"}}},
-        "context": {}
+        "context": {},
+        "diagnosis_id": "test_id"
     }
     
     # Case 1: Input as dict
@@ -205,7 +231,7 @@ async def test_diagnosis_agent_resume_structured_input(mock_dependencies):
     
     # Verify cleaning logic (extra should be removed)
     called_args = agent._execute_tool_and_check_next.call_args[0][3]
-    assert called_args == {"existing": "val", "param1": "value1"}
+    assert called_args == {"param1": "value1", "existing": "val"}
     assert "extra" not in called_args
     mock_dependencies["llm_assistant"].extract_parameters_by_schema.assert_not_called()
 
@@ -261,6 +287,9 @@ async def test_diagnosis_agent_auto_continue_sanitization(mock_dependencies):
     mock_evidence.id = "ev_id"
     mock_session_store.create_evidence.return_value = mock_evidence
     
+    mock_context = MagicMock()
+    mock_dependencies["session_store"].get_diagnosis_context.return_value = mock_context
+
     agent = DiagnosisAgent(
         mock_dependencies["mcp_gateway"],
         mock_dependencies["session_store"],
@@ -268,7 +297,13 @@ async def test_diagnosis_agent_auto_continue_sanitization(mock_dependencies):
         mock_dependencies["llm_assistant"]
     )
     
-    await agent._execute_tool_and_check_next("ses1", "step1", "tool1", {"arg1": "val1"}, 0, {})
+    mock_context = MagicMock()
+    mock_context.diagnosis_id = "test_id"
+    mock_context.revision = 1
+    mock_context.known_params = {}
+    mock_context.completed_steps = []
+    
+    await agent._execute_tool_and_check_next("ses1", "step1", "tool1", {"arg1": "val1"}, 0, mock_context)
     
     # Verify the second call (auto-continued one) was sanitized
     # First call: tool1, {"arg1": "val1"}

@@ -56,7 +56,7 @@ class IntentRouter:
                 extracted=extracted,
             )
 
-        if any(keyword in text for keyword in ["帮我分析", "帮我定位", "为什么慢", "性能问题", "通信慢", "快慢卡", "瓶颈"]):
+        if any(keyword in text for keyword in ["分析", "定位", "为什么慢", "性能问题", "通信慢", "快慢卡", "瓶颈", "profiling"]):
             return IntentDecision(
                 intent=IntentType.DIAGNOSIS,
                 confidence=0.82,

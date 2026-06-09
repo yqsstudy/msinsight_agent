@@ -1,9 +1,11 @@
 """会话存储 - 基于SQLite的会话持久化"""
 
+from __future__ import annotations
+
 import json
 import sqlite3
 from datetime import datetime
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, TYPE_CHECKING
 import os
 import uuid
 
@@ -18,6 +20,14 @@ from ..models.orchestration import (
     PendingInput,
     PendingInputOption,
 )
+if TYPE_CHECKING:
+    from ..core.diagnosis.models import DiagnosisAuditEvent, DiagnosisContext, DiagnosisOperation
+
+
+def _diagnosis_models():
+    from ..core.diagnosis.models import DiagnosisAuditEvent, DiagnosisContext, DiagnosisOperation, OperationStatus
+
+    return DiagnosisAuditEvent, DiagnosisContext, DiagnosisOperation, OperationStatus
 
 
 class SessionStore:
@@ -182,6 +192,66 @@ class SessionStore:
                 FOREIGN KEY (session_id) REFERENCES sessions(id),
                 FOREIGN KEY (report_id) REFERENCES reports(id)
             )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS diagnosis_contexts (
+                diagnosis_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_diagnosis_contexts_session_status
+            ON diagnosis_contexts(session_id, status)
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS diagnosis_operations (
+                operation_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                diagnosis_id TEXT,
+                idempotency_key TEXT,
+                type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                target_pending_id TEXT,
+                expected_revision INTEGER,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                error TEXT
+            )
+        """)
+        self._ensure_column(cursor, "diagnosis_operations", "error", "TEXT")
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_diagnosis_operations_session_status
+            ON diagnosis_operations(session_id, status)
+        """)
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_diagnosis_operations_session_idempotency
+            ON diagnosis_operations(session_id, idempotency_key)
+            WHERE idempotency_key IS NOT NULL
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS diagnosis_audit_events (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                diagnosis_id TEXT,
+                event_type TEXT NOT NULL,
+                revision INTEGER,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_diagnosis_audit_session_diag
+            ON diagnosis_audit_events(session_id, diagnosis_id, created_at)
         """)
 
         conn.commit()
@@ -400,6 +470,195 @@ class SessionStore:
                 self._upsert_execution_step(cursor, step)
         conn.commit()
         conn.close()
+
+    def create_diagnosis_context(self, context: DiagnosisContext) -> DiagnosisContext:
+        """创建或替换诊断上下文。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO diagnosis_contexts (
+                diagnosis_id, session_id, status, context_json, revision, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            context.diagnosis_id,
+            context.session_id,
+            self._enum_value(context.status),
+            context.model_dump_json(),
+            context.revision,
+            context.created_at.isoformat(),
+            context.updated_at.isoformat(),
+        ))
+        conn.commit()
+        conn.close()
+        return context
+
+    def update_diagnosis_context(self, context: DiagnosisContext) -> DiagnosisContext:
+        """更新诊断上下文。"""
+        context.updated_at = datetime.utcnow()
+        return self.create_diagnosis_context(context)
+
+    def get_diagnosis_context(self, diagnosis_id: str) -> Optional[DiagnosisContext]:
+        """按 diagnosis_id 获取诊断上下文。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM diagnosis_contexts WHERE diagnosis_id = ?", (diagnosis_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return self._row_to_diagnosis_context(row) if row else None
+
+    def get_active_diagnosis_context(self, session_id: str) -> Optional[DiagnosisContext]:
+        """获取 session 最新 active 诊断上下文。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM diagnosis_contexts
+            WHERE session_id = ? AND status = 'active'
+            ORDER BY updated_at DESC
+            LIMIT 1
+        """, (session_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return self._row_to_diagnosis_context(row) if row else None
+
+    def list_diagnosis_contexts(self, session_id: str, status: Optional[str] = None) -> List[DiagnosisContext]:
+        """列出 session 下诊断上下文。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        if status:
+            cursor.execute("""
+                SELECT * FROM diagnosis_contexts
+                WHERE session_id = ? AND status = ?
+                ORDER BY created_at DESC
+            """, (session_id, status))
+        else:
+            cursor.execute("""
+                SELECT * FROM diagnosis_contexts
+                WHERE session_id = ?
+                ORDER BY created_at DESC
+            """, (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._row_to_diagnosis_context(row) for row in rows]
+
+    def create_diagnosis_operation(self, operation: DiagnosisOperation) -> DiagnosisOperation:
+        """创建诊断操作；同一 idempotency_key 返回既有操作。"""
+        if operation.idempotency_key:
+            existing = self.find_operation_by_idempotency_key(operation.session_id, operation.idempotency_key)
+            if existing and existing.operation_id != operation.operation_id:
+                return existing
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO diagnosis_operations (
+                operation_id, session_id, diagnosis_id, idempotency_key, type, status,
+                payload_json, target_pending_id, expected_revision, created_at,
+                started_at, completed_at, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            operation.operation_id,
+            operation.session_id,
+            operation.diagnosis_id,
+            operation.idempotency_key,
+            self._enum_value(operation.type),
+            self._enum_value(operation.status),
+            json.dumps(operation.payload, ensure_ascii=False),
+            operation.target_pending_id,
+            operation.expected_revision,
+            operation.created_at.isoformat(),
+            operation.started_at.isoformat() if operation.started_at else None,
+            operation.completed_at.isoformat() if operation.completed_at else None,
+            operation.error,
+        ))
+        conn.commit()
+        conn.close()
+        return operation
+
+    def update_diagnosis_operation(self, operation: DiagnosisOperation) -> DiagnosisOperation:
+        """更新诊断操作。"""
+        return self.create_diagnosis_operation(operation)
+
+    def get_diagnosis_operation(self, operation_id: str) -> Optional[DiagnosisOperation]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM diagnosis_operations WHERE operation_id = ?", (operation_id,))
+        row = cursor.fetchone()
+        conn.close()
+        return self._row_to_diagnosis_operation(row) if row else None
+
+    def find_operation_by_idempotency_key(self, session_id: str, idempotency_key: str) -> Optional[DiagnosisOperation]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM diagnosis_operations
+            WHERE session_id = ? AND idempotency_key = ?
+            LIMIT 1
+        """, (session_id, idempotency_key))
+        row = cursor.fetchone()
+        conn.close()
+        return self._row_to_diagnosis_operation(row) if row else None
+
+    def list_queued_operations(self, session_id: str) -> List[DiagnosisOperation]:
+        _, _, _, OperationStatus = _diagnosis_models()
+        return self.list_diagnosis_operations(session_id, status=OperationStatus.QUEUED)
+
+    def list_diagnosis_operations(self, session_id: str, status: Optional[str] = None) -> List[DiagnosisOperation]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        if status:
+            cursor.execute("""
+                SELECT * FROM diagnosis_operations
+                WHERE session_id = ? AND status = ?
+                ORDER BY created_at ASC
+            """, (session_id, self._enum_value(status)))
+        else:
+            cursor.execute("""
+                SELECT * FROM diagnosis_operations
+                WHERE session_id = ?
+                ORDER BY created_at ASC
+            """, (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._row_to_diagnosis_operation(row) for row in rows]
+
+    def create_diagnosis_audit_event(self, event: DiagnosisAuditEvent) -> DiagnosisAuditEvent:
+        """创建诊断审计事件。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO diagnosis_audit_events (
+                id, session_id, diagnosis_id, event_type, revision, payload_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            event.id,
+            event.session_id,
+            event.diagnosis_id,
+            event.event_type,
+            event.revision,
+            json.dumps(event.payload, ensure_ascii=False),
+            event.created_at.isoformat(),
+        ))
+        conn.commit()
+        conn.close()
+        return event
+
+    def list_diagnosis_audit_events(self, session_id: str, diagnosis_id: Optional[str] = None) -> List[DiagnosisAuditEvent]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        if diagnosis_id:
+            cursor.execute("""
+                SELECT * FROM diagnosis_audit_events
+                WHERE session_id = ? AND diagnosis_id = ?
+                ORDER BY created_at ASC
+            """, (session_id, diagnosis_id))
+        else:
+            cursor.execute("""
+                SELECT * FROM diagnosis_audit_events
+                WHERE session_id = ?
+                ORDER BY created_at ASC
+            """, (session_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._row_to_diagnosis_audit_event(row) for row in rows]
 
     def create_evidence(self, request: CreateEvidenceRequest) -> Evidence:
         """创建证据记录"""
@@ -694,6 +953,40 @@ class SessionStore:
             created_at=datetime.fromisoformat(row["created_at"]),
         )
 
+    def _row_to_diagnosis_context(self, row: sqlite3.Row) -> "DiagnosisContext":
+        _, DiagnosisContext, _, _ = _diagnosis_models()
+        return DiagnosisContext.model_validate(json.loads(row["context_json"]))
+
+    def _row_to_diagnosis_operation(self, row: sqlite3.Row) -> "DiagnosisOperation":
+        _, _, DiagnosisOperation, OperationStatus = _diagnosis_models()
+        return DiagnosisOperation(
+            operation_id=row["operation_id"],
+            session_id=row["session_id"],
+            diagnosis_id=row["diagnosis_id"],
+            idempotency_key=row["idempotency_key"],
+            type=row["type"],
+            status=OperationStatus(row["status"]),
+            payload=json.loads(row["payload_json"] or "{}"),
+            target_pending_id=row["target_pending_id"],
+            expected_revision=row["expected_revision"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+            completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+            error=row["error"] if "error" in row.keys() else None,
+        )
+
+    def _row_to_diagnosis_audit_event(self, row: sqlite3.Row) -> "DiagnosisAuditEvent":
+        DiagnosisAuditEvent, _, _, _ = _diagnosis_models()
+        return DiagnosisAuditEvent(
+            id=row["id"],
+            session_id=row["session_id"],
+            diagnosis_id=row["diagnosis_id"],
+            event_type=row["event_type"],
+            revision=row["revision"],
+            payload=json.loads(row["payload_json"] or "{}"),
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
     def _row_to_pending_input(self, row: sqlite3.Row) -> PendingInput:
         options = [PendingInputOption(**item) for item in json.loads(row["options_json"] or "[]")]
         return PendingInput(
@@ -711,6 +1004,9 @@ class SessionStore:
             created_at=datetime.fromisoformat(row["created_at"]),
             resolved_at=datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None,
         )
+
+    def _enum_value(self, value: Any) -> Any:
+        return getattr(value, "value", value)
 
     def _context_to_dict(self, context: AnalysisContext) -> dict:
         """上下文转字典"""

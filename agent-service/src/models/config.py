@@ -104,6 +104,9 @@ class LLMAssistanceConfig:
     timeout_seconds: float = 3.0
     max_candidates: int = 5
     max_evidence_chars: int = 6000
+    prompt_composition_enabled: bool = True
+    prompt_composition_timeout_seconds: float = 10.0
+    expose_failure_to_frontend: bool = True
 
 
 @dataclass

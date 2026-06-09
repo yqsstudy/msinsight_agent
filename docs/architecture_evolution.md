@@ -19,23 +19,17 @@
 
 ## 二、 架构演进方向：分层多 Agent (Orchestrator-Worker)
 
-尽管项目已具备动态编排能力，随着业务场景（内存分析、通信分析、算子分析等）的复杂度激增，单一的 `Orchestrator` 容易成为维护瓶颈（臃肿的单体路由）。
+**本项目已成功实现“主从/分层式的智能体工作流 (Agentic Workflow)”。**
 
-**核心结论：不建议采用“去中心化对话式”的多 Agent（如 AutoGen/CrewAI），而应采用“主从/分层式的智能体工作流 (Agentic Workflow)”。**
-
-### 2.1 为什么拒绝“去中心化对话式”架构？
-1. **丧失确定性**：严肃的工业诊断场景不允许 Agent 自由闲聊导致逻辑跳跃或死循环。
-2. **调试灾难**：状态机混乱，前端无法渲染明确的进度条。
-3. **Token 消耗失控**：Agent 之间频繁传递海量日志上下文。
-
-### 2.2 推荐架构：主从/分层协作模式
+### 2.1 架构现状
 * **Orchestrator (父 Agent / 调度者)**：
   * 负责全局意图识别、生成顶层 `ExecutionPlan`。
   * 维护全局状态机，负责向前端发送规范的 SSE 流事件。
-* **Expert Sub-Agents (专家子 Agent / 执行者)**：
-  * 将 `_handle_diagnosis` 或特定领域的分析剥离为独立的子 Agent（如：DiagnosisAgent, KnowledgeAgent）。
-  * 拥有专属的 `System Prompt` 和受限的 MCP 工具集。
-  * 专注于执行特定任务，完成后向数据库写入 `Evidence`，并返回结构化结果。
+  * 实现了 **信号路由 (Signal Router)**，支持任务的挂起与精准唤醒。
+* **Expert Worker Agents (专家子 Agent / 执行者)**：
+  * **DiagnosisAgent**: 独立封装了 MCP 交互逻辑，持有专用的 LLM 提示词。
+  * **KnowledgeAgent**: 独立封装了 RAG 检索与证据固化逻辑。
+  * 遵循统一的 `BaseWorkerAgent` 接口，支持 `run` 和 `resume` 契约。
 
 ---
 

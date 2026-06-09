@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Message, Option, AnalysisReport, Session, HarnessTraceEvent, ExecutionPlan, Evidence } from '../types';
+import type { Message, Option, AnalysisReport, Session, HarnessTraceEvent, ExecutionPlan, Evidence, DiagnosisContextSummary, DiagnosisOperationSummary, CandidateSetView, PausedDiagnosisSummary, DiagnosisAuditEventView } from '../types';
 
 interface ChatState {
   // 当前会话
@@ -23,6 +23,11 @@ interface ChatState {
   evidence: Evidence[];
   reports: any[];
   pendingInput: any | null;
+  diagnosisContext: DiagnosisContextSummary | null;
+  diagnosisOperations: DiagnosisOperationSummary[];
+  activeCandidateSet: CandidateSetView | null;
+  pausedDiagnoses: PausedDiagnosisSummary[];
+  diagnosisAuditEvents: DiagnosisAuditEventView[];
 
   // 错误
   error: string | null;
@@ -44,6 +49,11 @@ interface ChatState {
   setEvidence: (evidence: Evidence[]) => void;
   setReports: (reports: any[]) => void;
   setPendingInput: (pendingInput: any | null) => void;
+  setDiagnosisContext: (context: DiagnosisContextSummary | null) => void;
+  upsertDiagnosisOperation: (operation: DiagnosisOperationSummary) => void;
+  setActiveCandidateSet: (candidateSet: CandidateSetView | null) => void;
+  upsertPausedDiagnosis: (diagnosis: PausedDiagnosisSummary) => void;
+  addDiagnosisAuditEvent: (event: DiagnosisAuditEventView) => void;
   addTraceEvent: (event: HarnessTraceEvent) => void;
   clearTraceEvents: () => void;
   setError: (error: string | null) => void;
@@ -67,6 +77,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   evidence: [],
   reports: [],
   pendingInput: null,
+  diagnosisContext: null,
+  diagnosisOperations: [],
+  activeCandidateSet: null,
+  pausedDiagnoses: [],
+  diagnosisAuditEvents: [],
   error: null,
 
   // Actions
@@ -157,6 +172,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setPendingInput: (pendingInput) => set({ pendingInput }),
 
+  setDiagnosisContext: (diagnosisContext) => set({ diagnosisContext }),
+
+  upsertDiagnosisOperation: (operation) => set((state) => ({
+    diagnosisOperations: state.diagnosisOperations.some((item) => item.operation_id === operation.operation_id)
+      ? state.diagnosisOperations.map((item) => (item.operation_id === operation.operation_id ? { ...item, ...operation } : item))
+      : [...state.diagnosisOperations, operation],
+  })),
+
+  setActiveCandidateSet: (activeCandidateSet) => set({ activeCandidateSet }),
+
+  upsertPausedDiagnosis: (diagnosis) => set((state) => ({
+    pausedDiagnoses: state.pausedDiagnoses.some((item) => item.diagnosis_id === diagnosis.diagnosis_id)
+      ? state.pausedDiagnoses.map((item) => (item.diagnosis_id === diagnosis.diagnosis_id ? { ...item, ...diagnosis } : item))
+      : [...state.pausedDiagnoses, diagnosis],
+  })),
+
+  addDiagnosisAuditEvent: (event) => set((state) => ({
+    diagnosisAuditEvents: [...state.diagnosisAuditEvents, event],
+  })),
+
   addTraceEvent: (event) => set((state) => ({
     traceEvents: [...state.traceEvents, event],
   })),
@@ -180,6 +215,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     evidence: [],
     reports: [],
     pendingInput: null,
+    diagnosisContext: null,
+    diagnosisOperations: [],
+    activeCandidateSet: null,
+    pausedDiagnoses: [],
+    diagnosisAuditEvents: [],
     error: null,
   }),
 
@@ -205,6 +245,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       evidence: session.evidence ?? [],
       reports: session.reports ?? [],
       pendingInput: session.pending_input ?? null,
+      diagnosisContext: null,
+      diagnosisOperations: [],
+      activeCandidateSet: null,
+      pausedDiagnoses: [],
+      diagnosisAuditEvents: [],
       inputQuestion: session.pending_input?.question ?? '',
       inputOptions: session.pending_input?.options ?? [],
       inputReason: session.pending_input?.reason ?? '',

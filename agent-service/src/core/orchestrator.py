@@ -1,5 +1,6 @@
 """Agent Harness orchestrator."""
 
+import asyncio
 import uuid
 from datetime import datetime
 from typing import Any, AsyncIterator, Dict, Optional
@@ -16,6 +17,9 @@ from .intent_router import IntentRouter
 from .interaction_policy import InteractionPolicy
 from .mcp_llm_assistant import MCPLLMOrchestrationAssistant
 from .report_generator import ReportGenerator
+from .diagnosis import DiagnosisContextManager, DiagnosisStatus, PendingInputRouter, PendingInputIntentType, compact_for_sse
+from .agents.diagnosis_agent import DiagnosisAgent
+from .agents.knowledge_agent import KnowledgeAgent
 
 
 class Orchestrator:
@@ -39,12 +43,17 @@ class Orchestrator:
         self.intent_router = IntentRouter(self.session_store)
         self.execution_planner = ExecutionPlanner()
         self.policy = InteractionPolicy(self.config)
+        self.pending_router = PendingInputRouter()
         self.report_generator = ReportGenerator()
         self.llm_router = llm_router or LLMRouter(config_store.get_llm_router_config())
         self.llm_assistant = llm_assistant or MCPLLMOrchestrationAssistant(
             self.llm_router,
             llm_assistance_config or config_store.get_llm_assistance_config(),
         )
+        self.agents = {
+            "diagnosis": DiagnosisAgent(self.mcp_gateway, self.session_store, self.policy, self.llm_assistant),
+            "knowledge": KnowledgeAgent(self.rag_client, self.session_store)
+        }
 
     async def close(self) -> None:
         await self.mcp_gateway.close()
@@ -143,236 +152,208 @@ class Orchestrator:
             confidence=EvidenceConfidence.HIGH,
             metadata={"pending_input_id": pending.id if pending else None},
         ))
+
+        contexts = self.session_store.list_diagnosis_contexts(session_id)
+        routed = self.pending_router.route(content, pending, contexts)
+        yield self._event("diagnosis_pending_routed", session_id, routed.model_dump(mode="json"))
+
+        if routed.intent == PendingInputIntentType.PAUSE_DIAGNOSIS and routed.diagnosis_id:
+            context = self.session_store.get_diagnosis_context(routed.diagnosis_id)
+            if context:
+                DiagnosisContextManager.mark_status(context, DiagnosisStatus.PAUSED)
+                self.session_store.update_diagnosis_context(context)
+            yield self._event("diagnosis_context_updated", session_id, compact_for_sse(context) if context else {"diagnosis_id": routed.diagnosis_id, "status": DiagnosisStatus.PAUSED})
+            yield self._event("message_delta", session_id, {"content": "已暂停当前诊断，稍后可以说“继续”恢复。"})
+            yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
+            return
+
+        if routed.intent == PendingInputIntentType.CANCEL_DIAGNOSIS and routed.diagnosis_id:
+            context = self.session_store.get_diagnosis_context(routed.diagnosis_id)
+            if context:
+                DiagnosisContextManager.mark_status(context, DiagnosisStatus.CANCELLED)
+                self.session_store.update_diagnosis_context(context)
+            if pending:
+                self.session_store.resolve_pending_input(pending.id)
+            yield self._event("diagnosis_context_updated", session_id, compact_for_sse(context) if context else {"diagnosis_id": routed.diagnosis_id, "status": DiagnosisStatus.CANCELLED})
+            yield self._event("message_delta", session_id, {"content": "已取消当前诊断。"})
+            yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
+            return
+
+        if routed.intent == PendingInputIntentType.RESTART_DIAGNOSIS:
+            if routed.diagnosis_id:
+                context = self.session_store.get_diagnosis_context(routed.diagnosis_id)
+                if context:
+                    DiagnosisContextManager.mark_status(context, DiagnosisStatus.SUPERSEDED)
+                    self.session_store.update_diagnosis_context(context)
+            if pending:
+                self.session_store.resolve_pending_input(pending.id)
+            async for event in self.handle_message(session_id, content):
+                yield event
+            return
+
+        if routed.intent == PendingInputIntentType.RESUME_PAUSED and routed.diagnosis_id:
+            context = self.session_store.get_diagnosis_context(routed.diagnosis_id)
+            if context:
+                DiagnosisContextManager.mark_status(context, DiagnosisStatus.ACTIVE)
+                self.session_store.update_diagnosis_context(context)
+                yield self._event("diagnosis_context_updated", session_id, compact_for_sse(context))
+                if context.pending:
+                    restored_pending = PendingInput(
+                        id=context.pending.pending_id,
+                        session_id=session_id,
+                        plan_id=context.plan_id,
+                        input_type="params",
+                        question=f"继续诊断：`{context.pending.tool_name}` 需要参数：{', '.join(context.pending.required_missing)}。",
+                        reason=context.pending.reason,
+                        metadata={
+                            "agent_type": "diagnosis",
+                            "resume_action": context.pending.resume_action,
+                            "tool_name": context.pending.tool_name,
+                            "required": context.pending.required_missing,
+                            "resolved_arguments": context.pending.resolved_arguments,
+                            "tool_schema": context.pending.tool_schema,
+                            "tool_schema_hash": context.pending.tool_schema_hash,
+                            "diagnosis_id": context.diagnosis_id,
+                            "context_revision": context.revision,
+                            "pending_id": context.pending.pending_id,
+                            "auto_step_count": context.pending.auto_step_count,
+                        },
+                    )
+                    self.session_store.create_pending_input(restored_pending)
+                    yield self._event("user_input_required", session_id, restored_pending.model_dump(mode="json"))
+                    yield self._event("message_end", session_id, {"state": OrchestratorState.WAITING_USER_INPUT.value})
+                    return
+            yield self._event("message_delta", session_id, {"content": "已恢复诊断。"})
+            yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
+            return
+
+        if routed.intent == PendingInputIntentType.SWITCH_TOPIC_OR_CHAT:
+            async for event in self.handle_message(session_id, content):
+                yield event
+            return
+
+        if routed.intent == PendingInputIntentType.ASK_STATUS:
+            summary = self._diagnosis_status_summary(contexts)
+            yield self._event("message_delta", session_id, {"content": summary})
+            yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
+            return
+
         if not pending:
             async for event in self.handle_message(session_id, content):
                 yield event
             return
 
+        if routed.intent == PendingInputIntentType.MODIFY_PREVIOUS_STEP:
+            yield self._event("user_input_required", session_id, {
+                "input_type": "confirm",
+                "question": "检测到你可能要修改历史步骤。该操作会在后续 P6 触发下游失效确认；当前阶段请明确要修改的步骤和参数。",
+                "reason": routed.reason,
+                "diagnosis_id": routed.diagnosis_id,
+                "target_step_index": routed.target_step_index,
+                "options": [],
+            })
+            yield self._event("message_end", session_id, {"state": OrchestratorState.WAITING_USER_INPUT.value})
+            return
+
         self.session_store.resolve_pending_input(pending.id)
-        resume_action = pending.metadata.get("resume_action")
-        if resume_action == "continue_mcp_with_args":
-            arguments = self._parse_user_arguments(user_input)
-            merged = {**pending.metadata.get("resolved_arguments", {}), **arguments}
-            tool_name = pending.metadata.get("tool_name")
-            if tool_name:
-                async for event in self._execute_mcp_chain(
-                    session_id,
-                    tool_name,
-                    merged,
-                    int(pending.metadata.get("auto_step_count", 0)),
-                    context=pending.metadata.get("context", {}),
-                ):
-                    yield event
-                yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
+        agent_type = pending.metadata.get("agent_type")
+
+        if agent_type and agent_type in self.agents:
+            agent = self.agents[agent_type]
+            result = await agent.resume(session_id, pending.plan_id or "", user_input, pending.metadata)
+
+            if result.status == "suspended" and result.requirement:
+                new_pending = PendingInput(
+                    id=result.requirement.metadata.get("pending_id") or f"pin_{uuid.uuid4().hex}",
+                    session_id=session_id,
+                    plan_id=pending.plan_id,
+                    input_type=result.requirement.input_type,
+                    question=result.requirement.question,
+                    options=[PendingInputOption(**opt) for opt in result.requirement.options],
+                    metadata=result.requirement.metadata,
+                    status="pending",
+                )
+                self.session_store.create_pending_input(new_pending)
+                yield self._event("user_input_required", session_id, new_pending.model_dump(mode="json"))
+                yield self._event("message_end", session_id, {"state": OrchestratorState.WAITING_USER_INPUT.value})
+                return
+            if result.status == "failed":
+                yield self._event("error", session_id, {"code": "AGENT_ERROR", "message": result.error_msg})
+                yield self._event("message_end", session_id, {"state": OrchestratorState.FAILED.value})
                 return
 
-        if resume_action == "select_playbook":
-            async for event in self._handle_diagnosis(session_id, pending.metadata.get("original_message", content), {"selected_playbook": content.strip()}):
+            yield self._event("analysis_result", session_id, {"summary": "分析继续并完成。", "evidence_ids": result.evidence_ids})
+            yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
+        else:
+            async for event in self.handle_message(session_id, content):
                 yield event
-            yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
-            return
 
-        if resume_action == "execute_next_tool":
-            confirmed = content.strip().lower() in {"true", "yes", "y", "1", "确认", "继续", "是"}
-            if confirmed:
-                tool_name = pending.metadata.get("tool_name")
-                if tool_name:
-                    async for event in self._execute_mcp_chain(
-                        session_id,
-                        tool_name,
-                        pending.metadata.get("resolved_arguments", {}),
-                        int(pending.metadata.get("auto_step_count", 0)),
-                        context=pending.metadata.get("context", {}),
-                    ):
-                        yield event
-                    yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
-                    return
-            yield self._event("analysis_result", session_id, {"summary": "用户未确认继续执行 MCP 工具。", "confidence": "medium"})
-            yield self._event("message_end", session_id, {"state": OrchestratorState.COMPLETED.value})
-            return
-
-        async for event in self.handle_message(session_id, content):
-            yield event
+    def _diagnosis_status_summary(self, contexts: list) -> str:
+        if not contexts:
+            return "当前没有诊断任务。"
+        lines = ["当前诊断任务："]
+        for context in contexts[:5]:
+            lines.append(f"- {context.diagnosis_id}: {context.status}, revision={context.revision}, current_tool={context.current_tool_name or '-'}")
+        return "\n".join(lines)
 
     async def _handle_knowledge(self, session_id: str, message: str, plan: Optional[ExecutionPlan] = None) -> AsyncIterator[SSEEventEnvelope]:
         step = self._find_first_step(plan, {"rag_qa", "rag_retrieve"})
         if step:
             yield self._start_step(step)
-        yield self._event("rag_retrieval", session_id, {"query": message, "status": "started"})
-        try:
-            result = await self.rag_client.retrieve(message)
-            evidence_ids = self._save_rag_evidence(session_id, result, plan)
-            yield self._event("rag_retrieval", session_id, {
-                "query": message,
-                "top_k": len(result.results),
-                "evidence_ids": evidence_ids,
-                "result_count": len(result.results),
-                "elapsed_ms": result.elapsed_ms,
-            })
-            if step:
-                yield self._complete_step(step, {"evidence_ids": evidence_ids, "result_count": len(result.results), "elapsed_ms": result.elapsed_ms})
-            summary = self._summarize_rag_results(result)
-            yield self._event("message_delta", session_id, {"content": summary})
-            if plan:
-                plan.status = ExecutionPlanStatus.COMPLETED
-                self.session_store.update_execution_plan(plan)
-        except Exception as exc:
-            evidence = self.session_store.create_evidence(CreateEvidenceRequest(
-                session_id=session_id,
-                plan_id=plan.id if plan else None,
-                step_id=step.id if step else None,
-                type=EvidenceType.SYSTEM_EVENT,
-                source="rag_client",
-                content=str(exc),
-                summary="RAG 服务不可用",
-                confidence=EvidenceConfidence.HIGH,
-                metadata={"code": "RAG_UNAVAILABLE"},
-            ))
-            if step:
-                yield self._fail_step(step, "RAG_UNAVAILABLE", str(exc))
-            yield self._event("error", session_id, {"code": "RAG_UNAVAILABLE", "message": str(exc), "evidence_id": evidence.id, "recoverable": True})
+        
+        result = await self.agents["knowledge"].run(session_id, step.id if step else "", message, {})
+        
+        if result.status == "failed":
+            yield self._event("error", session_id, {"code": "RAG_ERROR", "message": result.error_msg})
+            return
+            
+        yield self._event("message_delta", session_id, {"content": "已检索相关知识。"})
+        if plan:
+            plan.status = ExecutionPlanStatus.COMPLETED
+            self.session_store.update_execution_plan(plan)
+
+    def _build_blackboard_for_diagnosis(self, session_id: str, extracted: dict) -> dict:
+        return {
+            "extracted": extracted,
+        }
 
     async def _handle_diagnosis(self, session_id: str, message: str, extracted: Dict[str, Any], plan: Optional[ExecutionPlan] = None) -> AsyncIterator[SSEEventEnvelope]:
         search_step = self._find_step(plan, "mcp_search")
         if search_step:
             yield self._start_step(search_step)
-        try:
-            tools = await self.mcp_gateway.ensure_tools_loaded()
-            playbook_selection = await self.llm_assistant.select_playbook_from_tools(message, tools, {"extracted": extracted})
-            search_query = playbook_selection.get("query") or await self.llm_assistant.rewrite_query(message, {"extracted": extracted})
-            selected_playbook = extracted.get("selected_playbook") or playbook_selection.get("select_playbook")
-            search = await self.mcp_gateway.search_profiler_tools(search_query, selected_playbook)
-            search.playbook_candidates = await self.llm_assistant.recommend_playbook_candidate(
-                message,
-                search.playbook_candidates,
-                {"extracted": extracted, "search_query": search_query},
+        
+        blackboard = self._build_blackboard_for_diagnosis(session_id, extracted)
+        result = await self.agents["diagnosis"].run(session_id, search_step.id if search_step else "", message, blackboard)
+        
+        if result.status == "suspended" and result.requirement:
+            pending = PendingInput(
+                id=f"pin_{uuid.uuid4().hex}",
+                session_id=session_id,
+                plan_id=plan.id if plan else None,
+                input_type=result.requirement.input_type,
+                question=result.requirement.question,
+                options=[PendingInputOption(**opt) for opt in result.requirement.options],
+                metadata=result.requirement.metadata,
+                reason="Sub-agent requires input.",
+                status="pending"
             )
-            llm_selected_playbook = self._llm_selected_playbook(search.playbook_candidates)
-            if search.requires_user_choice and llm_selected_playbook:
-                search = await self.mcp_gateway.search_profiler_tools(search_query, llm_selected_playbook)
-                search.metadata = {
-                    **search.metadata,
-                    "llm_selected_playbook": llm_selected_playbook,
-                    "llm_auto_selection": True,
-                }
-            search_evidence = self.session_store.create_evidence(CreateEvidenceRequest(
-                session_id=session_id,
-                plan_id=plan.id if plan else None,
-                type=EvidenceType.MCP_OBSERVATION,
-                source="msinsight_mcp",
-                step_id=search_step.id if search_step else None,
-                content=search.text,
-                summary="MCP playbook 搜索结果",
-                confidence=EvidenceConfidence.MEDIUM,
-                metadata={
-                    "mcp_tool": "search_profiler_tools",
-                    "auto_selected_playbook": search.auto_selected_playbook,
-                    "selected_playbook": search.selected_playbook,
-                    "initial_step": search.initial_step.model_dump(by_alias=True) if search.initial_step else None,
-                    "suggested_arguments": search.suggested_arguments,
-                    "elapsed_ms": search.elapsed_ms,
-                    "raw": search.raw,
-                    "original_query": message,
-                    "search_query": search_query,
-                    "llm_query_rewritten": search_query != message,
-                    "llm_selected_playbook": search.metadata.get("llm_selected_playbook") or playbook_selection.get("select_playbook"),
-                    "llm_auto_selection": search.metadata.get("llm_auto_selection", False) or bool(playbook_selection.get("select_playbook")),
-                    "llm_playbook_selection": playbook_selection,
-                },
-            ))
-            yield self._event("mcp_tool_result", session_id, {
-                "tool_name": "search_profiler_tools",
-                "evidence_id": search_evidence.id,
-                "status": search.status,
-                "elapsed_ms": search.elapsed_ms,
-                "playbook_candidates": search.playbook_candidates,
-                "auto_selected_playbook": search.auto_selected_playbook,
-            })
-            if search_step:
-                search_step.evidence_ids.append(search_evidence.id)
-                yield self._complete_step(search_step, {
-                    "evidence_id": search_evidence.id,
-                    "status": search.status,
-                    "elapsed_ms": search.elapsed_ms,
-                    "auto_selected_playbook": search.auto_selected_playbook,
-                })
-            if plan:
-                plan.evidence_ids.append(search_evidence.id)
-                self.session_store.update_execution_plan(plan)
-        except Exception as exc:
-            evidence = self.session_store.create_evidence(CreateEvidenceRequest(
-                session_id=session_id,
-                plan_id=plan.id if plan else None,
-                step_id=search_step.id if search_step else None,
-                type=EvidenceType.SYSTEM_EVENT,
-                source="mcp_gateway",
-                content=str(exc),
-                summary="MCP 服务不可用，无法基于真实 profiling 数据验证",
-                confidence=EvidenceConfidence.HIGH,
-                metadata={"code": "MCP_UNAVAILABLE", "mcp_trace": self.mcp_gateway._last_trace()},
-            ))
-            if search_step:
-                yield self._fail_step(search_step, "MCP_UNAVAILABLE", str(exc))
-            yield self._event("error", session_id, {
-                "code": "MCP_UNAVAILABLE",
-                "message": str(exc),
-                "evidence_id": evidence.id,
-                "recoverable": True,
-                "degradation_options": [{"label": "降级为 RAG 知识建议", "value": "fallback_to_rag"}],
-            })
-            yield self._require_rag_fallback(session_id, message, plan)
-            return
-
-        pending = await self._pending_from_search(session_id, message, search, extracted, plan)
-        if pending:
             self.session_store.create_pending_input(pending)
             if plan:
                 plan.status = ExecutionPlanStatus.WAITING_USER
                 self.session_store.update_execution_plan(plan)
             yield self._event("user_input_required", session_id, pending.model_dump(mode="json"))
+            yield self._event("message_end", session_id, {"state": OrchestratorState.WAITING_USER_INPUT.value})
             return
 
-        initial_step = search.initial_step
-        resolved_args = self._resolve_step_arguments(initial_step, search.suggested_arguments, {"message": message, **extracted}) if initial_step else {}
-        resolved_args = await self.llm_assistant.extract_parameters(message, initial_step, resolved_args, {"message": message, **extracted})
-        context = {
-            "message": message,
-            "path": extracted.get("path"),
-            "selected_playbook": search.selected_playbook or search.auto_selected_playbook,
-            "search_suggested_arguments": search.suggested_arguments,
-        }
-        async for event in self._execute_mcp_chain(session_id, initial_step.tool_name, resolved_args, 0, plan, context=context):
-            yield event
+        if result.status == "failed":
+             yield self._event("error", session_id, {"code": "AGENT_ERROR", "message": result.error_msg})
+             yield self._event("message_end", session_id, {"state": OrchestratorState.FAILED.value})
+             return
+             
+        for evidence_id in result.evidence_ids:
+            yield self._event("mcp_tool_result", session_id, {"evidence_id": evidence_id, "status": "completed"})
+        yield self._event("analysis_result", session_id, {"summary": "诊断执行完成。", "confidence": "high", "evidence_ids": result.evidence_ids})
 
-        if self._should_call_rag_after_mcp(message):
-            try:
-                rag_result = await self.rag_client.retrieve(message)
-                rag_evidence_ids = self._save_rag_evidence(session_id, rag_result, plan)
-                yield self._event("rag_retrieval", session_id, {
-                    "query": message,
-                    "evidence_ids": rag_evidence_ids,
-                    "result_count": len(rag_result.results),
-                    "elapsed_ms": rag_result.elapsed_ms,
-                    "policy": "after_mcp",
-                })
-            except Exception as exc:
-                evidence = self.session_store.create_evidence(CreateEvidenceRequest(
-                    session_id=session_id,
-                    plan_id=plan.id if plan else None,
-                    type=EvidenceType.SYSTEM_EVENT,
-                    source="rag_client",
-                    content=str(exc),
-                    summary="RAG 检索失败，诊断仅包含 MCP 实测证据",
-                    confidence=EvidenceConfidence.MEDIUM,
-                    metadata={"code": "RAG_UNAVAILABLE"},
-                ))
-                yield self._event("error", session_id, {"code": "RAG_UNAVAILABLE", "message": str(exc), "evidence_id": evidence.id, "recoverable": True})
-
-        yield self._event("analysis_result", session_id, {"summary": "MCP 实测分析已完成，已保存工具观测结果。", "confidence": "medium"})
-
-        if self._should_generate_report(message):
-            report = self._generate_and_save_report(session_id, message, plan.id if plan else None)
-            yield self._event("report_ready", session_id, {"report_id": report["id"], "format": report["format"], "evidence_ids": report["evidence_ids"]})
         if plan:
             plan.status = ExecutionPlanStatus.COMPLETED
             self.session_store.update_execution_plan(plan)
@@ -389,6 +370,7 @@ class Orchestrator:
         context = context or {}
         current_tool = initial_tool
         current_args = initial_args
+        retry_state: Dict[str, Dict[str, int]] = {}
         while current_tool:
             step = self._find_step(plan, "mcp_execute")
             if step:
@@ -421,7 +403,11 @@ class Orchestrator:
                 next_step=result.next_step.model_dump(by_alias=True) if result.next_step else None,
                 elapsed_ms=result.elapsed_ms,
                 status=result.status,
-                raw=result.raw,
+                raw={
+                    **result.raw,
+                    "control_flow": result.control_flow.model_dump(mode="json") if result.control_flow else None,
+                    "data": result.data,
+                },
             )
             evidence = self.session_store.create_evidence(CreateEvidenceRequest(
                 session_id=session_id,
@@ -438,6 +424,8 @@ class Orchestrator:
                 "tool_name": current_tool,
                 "evidence_id": evidence.id,
                 "status": result.status,
+                "control_flow": result.control_flow.model_dump(mode="json") if result.control_flow else None,
+                "data": result.data,
                 "next_action": result.next_step.model_dump(by_alias=True) if result.next_step else None,
                 "elapsed_ms": result.elapsed_ms,
             })
@@ -447,12 +435,85 @@ class Orchestrator:
                     "tool_name": current_tool,
                     "evidence_id": evidence.id,
                     "status": result.status,
+                    "control_flow": result.control_flow.model_dump(mode="json") if result.control_flow else None,
+                    "data": result.data,
                     "next_action": result.next_step.model_dump(by_alias=True) if result.next_step else None,
                     "elapsed_ms": result.elapsed_ms,
                 })
             if plan and evidence.id not in plan.evidence_ids:
                 plan.evidence_ids.append(evidence.id)
                 self.session_store.update_execution_plan(plan)
+
+            control_flow = result.control_flow
+            if control_flow and control_flow.status == "BLOCKED":
+                key = f"{current_tool}:{control_flow.operation_id or hash(str(current_args))}:{control_flow.reason}"
+                state = retry_state.setdefault(key, {"attempts": 0, "total_wait_ms": 0})
+                delay_ms = min(control_flow.suggested_retry_after_ms or 3000, 10000)
+                if control_flow.retryable and state["attempts"] < 3 and state["total_wait_ms"] + delay_ms <= 30000:
+                    state["attempts"] += 1
+                    state["total_wait_ms"] += delay_ms
+                    yield self._event("control_flow_waiting", session_id, {
+                        "tool_name": current_tool,
+                        "reason": control_flow.reason,
+                        "event_name": control_flow.event_name,
+                        "operation_id": control_flow.operation_id,
+                        "retry_after_ms": delay_ms,
+                        "attempt": state["attempts"],
+                        "max_attempts": 3,
+                        "message_params": control_flow.message_params,
+                        "control_flow": control_flow.model_dump(mode="json"),
+                    })
+                    await asyncio.sleep(delay_ms / 1000)
+                    continue
+                pending = PendingInput(
+                    id=f"pin_{uuid.uuid4().hex}",
+                    session_id=session_id,
+                    plan_id=plan.id if plan else None,
+                    input_type="confirm",
+                    question="后台任务仍未完成，是否稍后重试？",
+                    reason=control_flow.user_message or control_flow.reason or "MCP 工具执行被阻塞。",
+                    recommended_value="true",
+                    metadata={"resume_action": "continue_mcp_with_args", "tool_name": current_tool, "resolved_arguments": current_args, "context": context, "auto_step_count": auto_count, "control_flow": control_flow.model_dump(mode="json")},
+                )
+                self.session_store.create_pending_input(pending)
+                yield self._event("user_input_required", session_id, pending.model_dump(mode="json"))
+                return
+
+            if control_flow and control_flow.status == "RETRYABLE_ERROR":
+                key = f"{current_tool}:{hash(str(current_args))}:{control_flow.reason}"
+                state = retry_state.setdefault(key, {"attempts": 0, "total_wait_ms": 0})
+                delay_ms = min(control_flow.suggested_retry_after_ms or 3000, 10000)
+                if control_flow.retryable and state["attempts"] < 3 and state["total_wait_ms"] + delay_ms <= 30000:
+                    state["attempts"] += 1
+                    state["total_wait_ms"] += delay_ms
+                    yield self._event("control_flow_retrying", session_id, {"tool_name": current_tool, "reason": control_flow.reason, "retry_after_ms": delay_ms, "attempt": state["attempts"], "max_attempts": 3, "control_flow": control_flow.model_dump(mode="json")})
+                    await asyncio.sleep(delay_ms / 1000)
+                    continue
+                yield self._event("error", session_id, {"code": control_flow.reason or "RETRYABLE_ERROR", "message": result.error or control_flow.user_message or "MCP 工具临时错误，已超过自动重试阈值。", "recoverable": True, "control_flow": control_flow.model_dump(mode="json")})
+                return
+
+            if control_flow and control_flow.status == "FATAL_ERROR":
+                yield self._event("error", session_id, {"code": control_flow.reason or "FATAL_ERROR", "message": result.error or control_flow.user_message or control_flow.developer_message or "MCP 工具不可恢复错误。", "recoverable": False, "control_flow": control_flow.model_dump(mode="json")})
+                return
+
+            if control_flow and control_flow.status == "NEEDS_USER_INPUT":
+                options = []
+                for required in control_flow.required_inputs:
+                    for option in required.options:
+                        options.append(PendingInputOption(label=str(option.get("label") or option.get("value")), value=str(option.get("value") or option.get("label")), description=str(option.get("description") or "")))
+                pending = PendingInput(
+                    id=f"pin_{uuid.uuid4().hex}",
+                    session_id=session_id,
+                    plan_id=plan.id if plan else None,
+                    input_type="choice" if options else "params",
+                    question=control_flow.user_message or "MCP 需要补充参数，请提供 required_inputs 中的参数。",
+                    reason=control_flow.reason or "MCP 需要用户输入。",
+                    options=options,
+                    metadata={"resume_action": "continue_mcp_with_args", "tool_name": current_tool, "required_inputs": [item.model_dump(mode="json") for item in control_flow.required_inputs], "resolved_arguments": current_args, "context": context, "auto_step_count": auto_count, "control_flow": control_flow.model_dump(mode="json")},
+                )
+                self.session_store.create_pending_input(pending)
+                yield self._event("user_input_required", session_id, pending.model_dump(mode="json"))
+                return
 
             decision = self.policy.decide_after_mcp_result(session_id, result, auto_count)
             if decision.action == "continue_auto" and result.next_step and result.next_step.tool_name:

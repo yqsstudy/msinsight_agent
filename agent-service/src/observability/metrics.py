@@ -165,6 +165,141 @@ RETRY_TOTAL = Counter(
     ["operation", "success"]
 )
 
+# ==================== Diagnosis Context 指标 ====================
+
+DIAGNOSIS_USER_PROMPTS_TOTAL = Counter(
+    "diagnosis_user_prompts_total",
+    "Total user prompts emitted by diagnosis workflow",
+    ["reason"]
+)
+
+DIAGNOSIS_AUTO_FILL_SUCCESS_TOTAL = Counter(
+    "diagnosis_auto_fill_success_total",
+    "Total successful diagnosis parameter auto-fills",
+    ["source"]
+)
+
+DIAGNOSIS_AUTO_FILL_FAILED_TOTAL = Counter(
+    "diagnosis_auto_fill_failed_total",
+    "Total failed diagnosis parameter auto-fill attempts",
+    ["reason"]
+)
+
+DIAGNOSIS_PARAM_CONFLICT_TOTAL = Counter(
+    "diagnosis_param_conflict_total",
+    "Total diagnosis parameter conflicts",
+    ["severity"]
+)
+
+DIAGNOSIS_ROLLBACK_TOTAL = Counter(
+    "diagnosis_rollback_total",
+    "Total diagnosis rollback operations",
+    ["reason"]
+)
+
+DIAGNOSIS_STEP_INVALIDATED_TOTAL = Counter(
+    "diagnosis_step_invalidated_total",
+    "Total invalidated diagnosis steps",
+    ["reason"]
+)
+
+DIAGNOSIS_RECONCILIATION_TOTAL = Counter(
+    "diagnosis_reconciliation_total",
+    "Total diagnosis MCP reconciliation attempts",
+    ["action"]
+)
+
+DIAGNOSIS_RECONCILIATION_FAILED_TOTAL = Counter(
+    "diagnosis_reconciliation_failed_total",
+    "Total failed diagnosis MCP reconciliation attempts",
+    ["reason"]
+)
+
+DIAGNOSIS_OPERATION_QUEUED_TOTAL = Counter(
+    "diagnosis_operation_queued_total",
+    "Total queued diagnosis operations",
+    ["type"]
+)
+
+DIAGNOSIS_OPERATION_STALE_TOTAL = Counter(
+    "diagnosis_operation_stale_total",
+    "Total stale diagnosis operations",
+    ["type"]
+)
+
+DIAGNOSIS_OPERATION_QUEUE_LENGTH = Gauge(
+    "diagnosis_operation_queue_length",
+    "Current queued diagnosis operation count",
+    ["session_id"]
+)
+
+DIAGNOSIS_OPERATION_WAIT_SECONDS = Histogram(
+    "diagnosis_operation_wait_seconds",
+    "Diagnosis operation queue wait time in seconds",
+    ["type"],
+    buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60]
+)
+
+DIAGNOSIS_CANDIDATE_SET_CREATED_TOTAL = Counter(
+    "diagnosis_candidate_set_created_total",
+    "Total diagnosis candidate sets created",
+    ["type"]
+)
+
+DIAGNOSIS_CANDIDATE_SELECTED_TOTAL = Counter(
+    "diagnosis_candidate_selected_total",
+    "Total diagnosis candidates selected",
+    ["type"]
+)
+
+DIAGNOSIS_CANDIDATE_INVALIDATED_TOTAL = Counter(
+    "diagnosis_candidate_invalidated_total",
+    "Total diagnosis candidate sets invalidated",
+    ["type"]
+)
+
+DIAGNOSIS_SCHEMA_DRIFT_TOTAL = Counter(
+    "diagnosis_schema_drift_total",
+    "Total diagnosis schema drift detections",
+    ["tool_name"]
+)
+
+DIAGNOSIS_SCHEMA_MIGRATION_SUCCESS_TOTAL = Counter(
+    "diagnosis_schema_migration_success_total",
+    "Total successful diagnosis schema migrations",
+    ["tool_name"]
+)
+
+DIAGNOSIS_SCHEMA_MIGRATION_FAILED_TOTAL = Counter(
+    "diagnosis_schema_migration_failed_total",
+    "Total failed diagnosis schema migrations",
+    ["tool_name"]
+)
+
+DIAGNOSIS_AUTO_STEPS_TOTAL = Counter(
+    "diagnosis_auto_steps_total",
+    "Total automatically executed diagnosis steps",
+    ["tool_name"]
+)
+
+DIAGNOSIS_AUTO_LIMIT_HIT_TOTAL = Counter(
+    "diagnosis_auto_limit_hit_total",
+    "Total diagnosis auto execution limit hits",
+    ["scope"]
+)
+
+DIAGNOSIS_REPORT_GENERATED_TOTAL = Counter(
+    "diagnosis_report_generated_total",
+    "Total diagnosis reports generated",
+    ["type"]
+)
+
+DIAGNOSIS_REPORT_INVALIDATED_EVIDENCE_EXCLUDED_TOTAL = Counter(
+    "diagnosis_report_invalidated_evidence_excluded_total",
+    "Total invalidated evidence items excluded from diagnosis reports",
+    ["report_type"]
+)
+
 # ==================== 便捷函数 ====================
 
 def track_request(method: str, endpoint: str):
@@ -267,3 +402,77 @@ def set_app_info(version: str, commit: str = ""):
 def set_app_status(status: str):
     """设置应用状态"""
     APP_STATUS.state(status)
+
+
+def record_diagnosis_user_prompt(reason: str):
+    DIAGNOSIS_USER_PROMPTS_TOTAL.labels(reason=reason or "unknown").inc()
+
+
+def record_diagnosis_auto_fill(success: bool, source_or_reason: str):
+    if success:
+        DIAGNOSIS_AUTO_FILL_SUCCESS_TOTAL.labels(source=source_or_reason or "unknown").inc()
+    else:
+        DIAGNOSIS_AUTO_FILL_FAILED_TOTAL.labels(reason=source_or_reason or "unknown").inc()
+
+
+def record_diagnosis_param_conflict(severity: str):
+    DIAGNOSIS_PARAM_CONFLICT_TOTAL.labels(severity=severity or "unknown").inc()
+
+
+def record_diagnosis_rollback(reason: str, invalidated_steps: int):
+    label = reason or "unknown"
+    DIAGNOSIS_ROLLBACK_TOTAL.labels(reason=label).inc()
+    DIAGNOSIS_STEP_INVALIDATED_TOTAL.labels(reason=label).inc(invalidated_steps)
+
+
+def record_diagnosis_reconciliation(action: str, failed_reason: str | None = None):
+    DIAGNOSIS_RECONCILIATION_TOTAL.labels(action=action or "unknown").inc()
+    if failed_reason:
+        DIAGNOSIS_RECONCILIATION_FAILED_TOTAL.labels(reason=failed_reason).inc()
+
+
+def record_diagnosis_operation_queued(operation_type: str, queue_length: int | None = None, session_id: str | None = None):
+    DIAGNOSIS_OPERATION_QUEUED_TOTAL.labels(type=operation_type or "unknown").inc()
+    if queue_length is not None and session_id:
+        DIAGNOSIS_OPERATION_QUEUE_LENGTH.labels(session_id=session_id).set(queue_length)
+
+
+def record_diagnosis_operation_stale(operation_type: str):
+    DIAGNOSIS_OPERATION_STALE_TOTAL.labels(type=operation_type or "unknown").inc()
+
+
+def record_diagnosis_operation_wait(operation_type: str, seconds: float):
+    DIAGNOSIS_OPERATION_WAIT_SECONDS.labels(type=operation_type or "unknown").observe(max(seconds, 0.0))
+
+
+def record_diagnosis_candidate_set(event: str, candidate_type: str):
+    if event == "created":
+        DIAGNOSIS_CANDIDATE_SET_CREATED_TOTAL.labels(type=candidate_type or "unknown").inc()
+    elif event == "selected":
+        DIAGNOSIS_CANDIDATE_SELECTED_TOTAL.labels(type=candidate_type or "unknown").inc()
+    elif event == "invalidated":
+        DIAGNOSIS_CANDIDATE_INVALIDATED_TOTAL.labels(type=candidate_type or "unknown").inc()
+
+
+def record_diagnosis_schema_migration(tool_name: str, drift_detected: bool, success: bool):
+    label = tool_name or "unknown"
+    if drift_detected:
+        DIAGNOSIS_SCHEMA_DRIFT_TOTAL.labels(tool_name=label).inc()
+    if success:
+        DIAGNOSIS_SCHEMA_MIGRATION_SUCCESS_TOTAL.labels(tool_name=label).inc()
+    else:
+        DIAGNOSIS_SCHEMA_MIGRATION_FAILED_TOTAL.labels(tool_name=label).inc()
+
+
+def record_diagnosis_auto_step(tool_name: str):
+    DIAGNOSIS_AUTO_STEPS_TOTAL.labels(tool_name=tool_name or "unknown").inc()
+
+
+def record_diagnosis_auto_limit(scope: str):
+    DIAGNOSIS_AUTO_LIMIT_HIT_TOTAL.labels(scope=scope or "unknown").inc()
+
+
+def record_diagnosis_report(report_type: str, excluded_invalidated_evidence: int = 0):
+    DIAGNOSIS_REPORT_GENERATED_TOTAL.labels(type=report_type or "current").inc()
+    if excluded_invalidated_evidence:
+        DIAGNOSIS_REPORT_INVALIDATED_EVIDENCE_EXCLUDED_TOTAL.labels(report_type=report_type or "current").inc(excluded_invalidated_evidence)

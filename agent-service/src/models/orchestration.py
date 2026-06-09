@@ -142,6 +142,28 @@ class MCPNextStep(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class RequiredInput(BaseModel):
+    name: str
+    type: str = "string"
+    description: Optional[str] = None
+    required: bool = True
+    options: List[Dict[str, Any]] = Field(default_factory=list)
+    default: Any = None
+
+
+class ControlFlow(BaseModel):
+    status: str
+    reason: Optional[str] = None
+    retryable: Optional[bool] = None
+    suggested_retry_after_ms: Optional[int] = None
+    event_name: Optional[str] = None
+    operation_id: Optional[str] = None
+    required_inputs: List[RequiredInput] = Field(default_factory=list)
+    message_params: Dict[str, Any] = Field(default_factory=dict)
+    user_message: Optional[str] = None
+    developer_message: Optional[str] = None
+
+
 class MCPToolResult(BaseModel):
     status: str
     tool_name: Optional[str] = None
@@ -151,6 +173,8 @@ class MCPToolResult(BaseModel):
     error: Optional[str] = None
     elapsed_ms: Optional[int] = None
     raw: Dict[str, Any] = Field(default_factory=dict)
+    control_flow: Optional[ControlFlow] = None
+    data: Dict[str, Any] = Field(default_factory=dict)
 
 
 class MCPSearchResult(BaseModel):

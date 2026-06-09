@@ -24,9 +24,10 @@ msinsight_agent/
 ### 后端
 - Python 3.10+
 - FastAPI
+- Hierarchical Multi-Agent Orchestrator (Orchestrator-Worker Model)
 - LLM Router (Claude/OpenAI/本地模型)
 - MCP Client (HTTP/Stdio/SSE/WebSocket)
-- DAG工作流引擎
+- Evidence Store (Blackboard Pattern)
 - Prometheus指标
 
 ### 前端

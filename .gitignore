@@ -1,0 +1,15 @@
+# Standalone subprojects excluded from this repository upload
+rag_code/
+mcp_service_code/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Test/type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

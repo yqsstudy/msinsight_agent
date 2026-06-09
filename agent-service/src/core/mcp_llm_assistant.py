@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from ..llm import LLMRouter
@@ -25,6 +26,7 @@ class MCPLLMOrchestrationAssistant:
     def __init__(self, llm_router: Optional[LLMRouter] = None, config: Optional[LLMAssistanceConfig] = None):
         self.llm_router = llm_router
         self.config = config or LLMAssistanceConfig()
+        self._last_failure: Dict[str, Any] = {}
 
     async def rewrite_query(self, user_text: str, context: Optional[Dict[str, Any]] = None) -> str:
         if not self._enabled("query_rewrite"):
@@ -158,6 +160,27 @@ class MCPLLMOrchestrationAssistant:
                 merged[key] = value
         return merged
 
+    async def compose_user_prompt(self, prompt_context: Dict[str, Any], fallback_question: str) -> str:
+        if not self.config.prompt_composition_enabled:
+            return fallback_question
+        payload = await self._chat_json(
+            "prompt_composition",
+            [
+                {"role": "system", "content": "Generate a concise, user-friendly Chinese question for a profiling diagnosis pause. Return only JSON: {\"question\": string}. Do not invent tools, parameters, candidates, or facts. Do not change structured fields or options."},
+                {"role": "user", "content": json.dumps(prompt_context or {}, ensure_ascii=False)},
+            ],
+            log_context={
+                "tool_name": prompt_context.get("tool_name"),
+                "required_keys": prompt_context.get("missing_required"),
+                "fallback": "deterministic_prompt_template",
+            },
+            timeout_seconds=self.config.prompt_composition_timeout_seconds,
+        )
+        question = payload.get("question") if isinstance(payload, dict) else None
+        if isinstance(question, str) and question.strip():
+            return question.strip()
+        return fallback_question
+
     async def enhance_summary(self, deterministic_summary: str, evidence: Dict[str, Any]) -> str:
         if not deterministic_summary or not self._enabled("summary_enhancement"):
             return deterministic_summary
@@ -179,53 +202,151 @@ class MCPLLMOrchestrationAssistant:
         summary = result.summary.strip()
         return summary or deterministic_summary
 
-    async def extract_parameters_by_schema(self, user_input: str, tool_schema: dict, existing_args: dict) -> dict:
+    async def extract_parameters_by_schema(
+        self,
+        user_input: str,
+        tool_schema: dict,
+        existing_args: dict,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> dict:
         """
-        Prompts the LLM to extract parameters from user_input based strictly on the provided JSON Schema.
-        Returns a dictionary of newly extracted parameters.
+        Extract parameters from user_input based strictly on the provided JSON Schema.
+
+        The returned object is advisory and schema-filtered. State changes,
+        conflict handling, and invalidation decisions belong to ParameterResolver.
         """
-        import json
-        
+        properties = tool_schema.get("properties", {}) if isinstance(tool_schema, dict) else {}
+        allowed = set(properties.keys()) if isinstance(properties, dict) else set()
         system_prompt = f"""
 You are an expert parameter extraction assistant.
 Your task is to extract parameters from the user's input to fulfill the required tool arguments.
 
 TOOL JSON SCHEMA:
-{json.dumps(tool_schema, ensure_ascii=False, indent=2)}
+{json.dumps(tool_schema or {}, ensure_ascii=False, indent=2)}
 
 ALREADY PROVIDED ARGUMENTS (Do not extract these again unless the user explicitly overrides them):
-{json.dumps(existing_args, ensure_ascii=False, indent=2)}
+{json.dumps(existing_args or {}, ensure_ascii=False, indent=2)}
+
+DIAGNOSIS COMPACT CONTEXT (effective context only; invalidated details are intentionally excluded):
+{json.dumps(context or {}, ensure_ascii=False, indent=2)}
 
 INSTRUCTIONS:
 1. Extract values from the user's input that match the properties defined in the TOOL JSON SCHEMA.
 2. Return ONLY a valid JSON object containing the extracted key-value pairs.
 3. Do not include markdown formatting like ```json or any other text.
-4. If no parameters can be extracted, return an empty JSON object: {{}}
+4. Do not return fields outside TOOL JSON SCHEMA properties.
+5. Do not overwrite ALREADY PROVIDED ARGUMENTS unless the user explicitly says they are changing that value.
+6. If no parameters can be extracted, return an empty JSON object: {{}}
 """
         messages = [
             {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": user_input}
+            {"role": "user", "content": user_input},
         ]
-        
-        response = await self._chat_json("extract_parameters_by_schema", messages)
-        return response if response is not None else {}
 
-    async def _chat_json(self, stage: str, messages: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
+        response = await self._chat_json(
+            "extract_parameters_by_schema",
+            messages,
+            log_context={
+                "tool_name": (context or {}).get("tool_name"),
+                "required_keys": tool_schema.get("required", []) if isinstance(tool_schema, dict) else [],
+                "schema_keys": list(allowed),
+                "fallback": "deterministic_parameter_resolution",
+            },
+        )
+        if not isinstance(response, dict):
+            return {}
+        parameters = response.get("parameters") if isinstance(response.get("parameters"), dict) else response
+        if not allowed:
+            return parameters
+        return {key: value for key, value in parameters.items() if key in allowed and value not in (None, "")}
+
+    async def _chat_json(
+        self,
+        stage: str,
+        messages: List[Dict[str, str]],
+        *,
+        log_context: Optional[Dict[str, Any]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        self._last_failure = {}
         if not self.llm_router:
             return None
+        started = time.perf_counter()
+        effective_timeout = timeout_seconds or self.config.timeout_seconds
+        safe_context = {k: v for k, v in (log_context or {}).items() if v not in (None, "", [], {})}
+        provider = getattr(self.llm_router, "provider", None) or getattr(self.llm_router, "provider_name", None) or safe_context.get("provider") or "unknown"
+        model = getattr(self.llm_router, "model", None) or getattr(self.llm_router, "model_name", None) or safe_context.get("model") or "unknown"
+        fallback = safe_context.get("fallback", "deterministic_fallback")
         try:
             response = await asyncio.wait_for(
-                self.llm_router.chat(messages=messages, temperature=0.1),
-                timeout=self.config.timeout_seconds,
+                self.llm_router.chat(messages=messages),
+                timeout=effective_timeout,
             )
             content = response.get("content", "") if isinstance(response, dict) else str(response)
             parsed = self._parse_json_object(content)
             if not isinstance(parsed, dict):
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                self._last_failure = {
+                    "status": "error",
+                    "stage": stage,
+                    "fallback": fallback,
+                    "reason": "invalid_json",
+                }
+                logger.warning(
+                    "LLM assistance returned invalid JSON at %s: elapsed_ms=%.2f provider=%s model=%s fallback=%s context=%s",
+                    stage,
+                    elapsed_ms,
+                    provider,
+                    model,
+                    fallback,
+                    safe_context,
+                )
                 return None
             return parsed
-        except Exception as exc:
-            logger.warning(f"LLM assistance failed at {stage}: {type(exc).__name__}: {exc}")
+        except asyncio.TimeoutError as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self._last_failure = {
+                "status": "timeout",
+                "stage": stage,
+                "fallback": fallback,
+            }
+            logger.warning(
+                "LLM assistance timeout at %s: exception_type=%s exception_repr=%r timeout_seconds=%s elapsed_ms=%.2f provider=%s model=%s fallback=%s context=%s",
+                stage,
+                type(exc).__name__,
+                exc,
+                effective_timeout,
+                elapsed_ms,
+                provider,
+                model,
+                fallback,
+                safe_context,
+            )
             return None
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self._last_failure = {
+                "status": "error",
+                "stage": stage,
+                "fallback": fallback,
+                "exception_type": type(exc).__name__,
+            }
+            logger.warning(
+                "LLM assistance failed at %s: exception_type=%s exception_repr=%r timeout_seconds=%s elapsed_ms=%.2f provider=%s model=%s fallback=%s context=%s",
+                stage,
+                type(exc).__name__,
+                exc,
+                effective_timeout,
+                elapsed_ms,
+                provider,
+                model,
+                fallback,
+                safe_context,
+            )
+            return None
+
+    def last_failure_summary(self) -> Dict[str, Any]:
+        return dict(self._last_failure or {})
 
     def _enabled(self, stage: str) -> bool:
         if not self.config.enabled:

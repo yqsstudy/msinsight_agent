@@ -17,7 +17,11 @@ class ClaudeAdapter(BaseLLMAdapter):
         if self._client is None:
             try:
                 import anthropic
-                self._client = anthropic.AsyncAnthropic(api_key=self.api_key)
+
+                client_kwargs = {"api_key": self.api_key}
+                if self.api_url:
+                    client_kwargs["base_url"] = self.api_url.rstrip("/")
+                self._client = anthropic.AsyncAnthropic(**client_kwargs)
             except ImportError:
                 raise ImportError("请安装anthropic库: pip install anthropic")
         return self._client

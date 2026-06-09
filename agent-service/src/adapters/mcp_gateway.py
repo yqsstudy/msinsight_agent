@@ -1,5 +1,6 @@
 """MCP meta-tool gateway adapter."""
 
+import json
 import time
 from typing import Any, Dict, Optional
 
@@ -66,7 +67,7 @@ class MCPGateway:
         structured = self._structured_payload(safe_raw)
         selected_playbook = self.parser.parse_selected_playbook(structured, text)
         initial_step = self.parser.parse_initial_step(structured, text)
-        candidates = self.parser.parse_candidates(structured)
+        candidates = self.parser.parse_candidates(structured, text)
         suggested_arguments = self.parser.parse_suggested_arguments(structured)
         requires_choice = bool(candidates) and not selected_playbook
         if "请选择" in text and not selected_playbook:
@@ -100,18 +101,29 @@ class MCPGateway:
 
         elapsed_ms = int((time.time() - start) * 1000)
         text = self._extract_text(raw)
-        next_step = self.parser.parse_next_step(text)
-        requires_input = self.parser.requires_user_input(text) and not next_step
-        status = "completed" if not text.startswith("ERROR") else "failed"
+        safe_raw = self._safe_raw(raw)
+        structured = self._structured_payload(safe_raw)
+        control_flow = self.parser.parse_control_flow(structured)
+        data = self.parser.parse_data(structured)
+        next_step = self.parser.parse_next_step_from_data(structured)
+        if not next_step and control_flow.status == "SUCCESS":
+            next_step = self.parser.parse_next_step(text)
+        requires_input = control_flow.status == "NEEDS_USER_INPUT"
+        status = "completed" if control_flow.status in {"SUCCESS", "BLOCKED", "NEEDS_USER_INPUT"} else "failed"
+        error = None
+        if control_flow.status in {"RETRYABLE_ERROR", "FATAL_ERROR"}:
+            error = data.get("error") or control_flow.developer_message or control_flow.user_message or text
         return MCPToolResult(
             status=status,
             tool_name=tool_name,
             text=text,
             next_step=next_step,
             requires_user_input=requires_input,
-            error=text if status == "failed" else None,
+            error=error,
             elapsed_ms=elapsed_ms,
-            raw=self._safe_raw(raw),
+            raw=safe_raw,
+            control_flow=control_flow,
+            data=data,
         )
 
     async def health(self) -> Dict[str, Any]:
@@ -180,13 +192,45 @@ class MCPGateway:
         parsed = raw.get("parsedContent")
         if isinstance(parsed, dict):
             return parsed
+        if isinstance(parsed, str):
+            parsed_json = self._json_object(parsed)
+            if parsed_json:
+                return parsed_json
         structured = raw.get("structuredContent") or raw.get("structured_content")
         if isinstance(structured, dict):
             return structured
+        if isinstance(structured, str):
+            structured_json = self._json_object(structured)
+            if structured_json:
+                return structured_json
+        if "content" in raw and isinstance(raw["content"], list):
+            for item in raw["content"]:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        content_json = self._json_object(text)
+                        if content_json:
+                            return content_json
+        text = raw.get("text")
+        if isinstance(text, str):
+            text_json = self._json_object(text)
+            if text_json:
+                return text_json
         result = raw.get("result")
         if isinstance(result, dict):
             return self._structured_payload(result)
+        if isinstance(result, str):
+            result_json = self._json_object(result)
+            if result_json:
+                return result_json
         return raw
+
+    def _json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
 
     def _last_trace(self) -> Optional[Dict[str, Any]]:
         transport = getattr(self.client, "_transport", None)
